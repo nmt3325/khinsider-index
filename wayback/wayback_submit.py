@@ -12,13 +12,24 @@ if os.path.exists(DONE_FILE):
 
 s = requests.Session()
 s.headers.update({'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'})
+# Optional: route via proxy (HTTPS_PROXY env var is honored automatically by requests)
+# Optional: authenticated SPN2 (higher quota, per-account): set ARCHIVE_ORG_S3_ACCESS / ARCHIVE_ORG_S3_SECRET
+S3_ACCESS = os.environ.get('ARCHIVE_ORG_S3_ACCESS')
+S3_SECRET = os.environ.get('ARCHIVE_ORG_S3_SECRET')
+USE_SPN2 = bool(S3_ACCESS and S3_SECRET)
+if USE_SPN2:
+    s.headers.update({'Authorization': f'LOW {S3_ACCESS}:{S3_SECRET}'})
+    print('using authenticated SPN2 API', flush=True)
 dn = open(DONE_FILE, 'a', buffering=1)
 fl = open(FAIL_FILE, 'a', buffering=1)
 
 def submit(url):
     for attempt in range(6):
         try:
-            r = s.get('https://web.archive.org/save/' + url, timeout=90, allow_redirects=True)
+            if USE_SPN2:
+                r = s.post('https://web.archive.org/save', data={'url': url}, timeout=90)
+            else:
+                r = s.get('https://web.archive.org/save/' + url, timeout=90, allow_redirects=True)
             if r.status_code == 200:
                 return True
             if r.status_code >= 500 or r.status_code == 429:
