@@ -1,0 +1,92 @@
+name: Crawl album metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: Number of parallel crawl shards
+        default: "8"
+      limit:
+        description: Max albums per shard (0 = no limit)
+        default: "0"
+      letters:
+        description: Optional browse sections, e.g. 0-9,A,B
+        default: ""
+      workers:
+        description: Fetchers per shard
+        default: "4"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          n = int(os.environ['SHARDS'])
+          print('matrix=' + json.dumps({'shard': [f'{i}/{n}' for i in range(1, n + 1)]}))
+          PY
+        env:
+          SHARDS: ${{ github.event.inputs.shards }}
+
+  crawl:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r scripts/requirements.txt
+      - name: Crawl shard ${{ matrix.shard }}
+        run: |
+          python3 scripts/crawl_album_meta.py \
+            --shard "${{ matrix.shard }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --limit "${{ github.event.inputs.limit }}" \
+            --letters "${{ github.event.inputs.letters }}" \
+            --out "album-meta.ndjson" \
+            --failures "album-meta-failures.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: album-meta-${{ strategy.job-index }}
+          path: |
+            album-meta.ndjson
+            album-meta-failures.log
+          if-no-files-found: warn
+
+  library:
+    needs: crawl
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r scripts/requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: album-meta-*
+          path: shards
+      - name: Merge shards
+        run: |
+          find shards -name 'album-meta.ndjson' -exec cat {} + > album-meta.ndjson
+          find shards -name 'album-meta-failures.log' -exec cat {} + > album-meta-failures.log || true
+          wc -l album-meta.ndjson
+      - name: Build library.json
+        run: python3 scripts/build_library.py --gzip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: library
+          path: |
+            library.json.gz
+            album-meta.ndjson
+            album-meta-failures.log

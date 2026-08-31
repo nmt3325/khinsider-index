@@ -15,3 +15,10 @@
 # vendor/
 
 scripts/venv
+# album metadata crawl artifacts (published as release assets / CI artifacts)
+album-meta.ndjson
+album-meta-failures.log
+library.json
+library.json.gz
+__pycache__/
+*.pyc
