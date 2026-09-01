@@ -21,11 +21,15 @@ registers each one with the Wayback Machine (Save Page Now).
 - 104,431 albums in the live index (2026-09-01 rebuild)
 - 1,310,089 unique track URLs extracted from the 47,288 cached albums (1,310,140 songs)
 - 58,111 albums still need their album page crawled for track URLs
-- WARNING: anonymous Save Page Now appears blocked from datacenter IPs
-  (GitHub-hosted runners): even the example.com control save failed (HTTP 523 /
-  connection timeout). For real throughput use archive.org S3 credentials
-  (SPN2 API: POST https://web.archive.org/save with `Authorization: LOW key:secret`)
-  or run `wayback_submit.py` from a residential connection.
+- UPDATE 2026-09-01: SPN2 (authenticated) VERIFIED WORKING from Google Colab:
+  album page and track page captures confirmed in CDX (status 200). GitHub-hosted
+  runner IPs are edge-blocked even WITH auth; anonymous SPN is also rate-limited on
+  Colab. Use `spn2_submit.py` with ARCHIVE_ORG_S3_ACCESS / ARCHIVE_ORG_S3_SECRET from
+  https://archive.org/account/s3.php on Colab or a residential IP.
+- Track URLs now serve HTML pages (status 200) embedding the current direct MP3
+  link (host migrated: vgmsite.com -> jetta.vgmtreasurechest.com), so track-page
+  captures preserve the pointer to each file. Direct MP3 capture via Wayback is
+  currently unreliable (archive.org fetcher 523s on vgmsite URLs).
 
 ## Release assets (tag `song-urls-2026-09-01`)
 - `wayback_queue_khinsider-track-urls.txt.gz` — canonical track-page URLs (SPN queue)
