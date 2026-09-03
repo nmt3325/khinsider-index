@@ -75,7 +75,7 @@ contend for the same commit.
 ## Running it by hand
 
 ```sh
-pip install -r scripts/requirements.txt
+pip install -r scripts/requirements-meta.txt
 
 python scripts/crawl_index_pages.py --max-pages 3      # resumable; rerun to continue
 python scripts/crawl_facets.py --kind publisher --limit 20

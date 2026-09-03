@@ -1,0 +1,6 @@
+# Dependencies for the album metadata pipeline (album_list.py and the crawlers
+# and builders around it). Kept apart from requirements.txt, whose pins date
+# from the original Go-era scrapers and conflict with curl_cffi.
+beautifulsoup4>=4.12
+lxml>=5.0
+curl_cffi>=0.7

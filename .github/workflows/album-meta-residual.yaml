@@ -63,10 +63,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: scripts/requirements.txt
+          cache-dependency-path: scripts/requirements-meta.txt
 
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r scripts/requirements.txt
+        run: python -m pip install --disable-pip-version-check -r scripts/requirements-meta.txt
 
       - name: Fetch the crawl state and the current library
         run: |
