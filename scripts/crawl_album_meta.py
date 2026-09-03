@@ -27,6 +27,7 @@ permanent failures are appended to the failure log and can be retried later
 with --retry-failures.
 """
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -94,14 +95,30 @@ def load_done(path):
     return done
 
 
-def load_failed(path):
+PERMANENT_NOTES = ('gone', 'no album content')
+
+
+def load_failed(path, permanent_only=True):
+    """Slugs from the failure log.
+
+    Only permanent failures are worth skipping forever: a 404, or a page with
+    no album content. Cloudflare challenges, timeouts and 5xx are transient,
+    so by default they stay in the queue and get retried on the next run -
+    otherwise one bad afternoon would blacklist those albums permanently.
+    """
     failed = set()
-    if os.path.exists(path):
-        with open(path, encoding='utf-8') as f:
-            for line in f:
-                slug = line.split('\t', 1)[0].strip()
-                if slug:
-                    failed.add(slug)
+    if not os.path.exists(path):
+        return failed
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            parts = line.rstrip('\n').split('\t')
+            slug = parts[0].strip()
+            if not slug:
+                continue
+            note = parts[1].strip() if len(parts) > 1 else ''
+            if permanent_only and note not in PERMANENT_NOTES:
+                continue
+            failed.add(slug)
     return failed
 
 
@@ -145,13 +162,25 @@ def main():
     ap.add_argument('--letters', default='', help='only these browse sections, e.g. 0-9,A,B')
     ap.add_argument('--shard', default='', help='process shard i/n, e.g. 3/8')
     ap.add_argument('--slug', action='append', default=[], help='crawl specific slugs only')
+    ap.add_argument('--slugs-file', default='',
+                    help='newline-separated slugs to crawl, e.g. from residual_slugs.py')
+    ap.add_argument('--order', choices=('index', 'hash', 'file'), default='index',
+                    help='queue order: index.json order, deterministic hash, or as given')
+    ap.add_argument('--deadline-minutes', type=float, default=0.0,
+                    help='stop cleanly after N minutes (0 = no deadline)')
     ap.add_argument('--refresh', action='store_true', help='re-crawl albums already in --out')
     ap.add_argument('--retry-failures', action='store_true', help='also retry slugs in the failure log')
     ap.add_argument('--progress-every', type=int, default=50)
     args = ap.parse_args()
 
-    if args.slug:
+    if args.slug or args.slugs_file:
         targets = [(s, s) for s in args.slug]
+        if args.slugs_file:
+            with open(args.slugs_file, encoding='utf-8') as f:
+                for line in f:
+                    slug = line.strip()
+                    if slug:
+                        targets.append((slug, slug))
     else:
         targets = load_slugs(args.index)
         if args.letters:
@@ -161,10 +190,15 @@ def main():
             i, n = (int(x) for x in args.shard.split('/'))
             targets = [row for k, row in enumerate(targets) if k % n == (i - 1) % n]
 
+    if args.order == 'hash':
+        # deterministic shuffle: successive capped runs sample the whole
+        # archive evenly instead of grinding through the same prefix
+        targets.sort(key=lambda row: hashlib.md5(row[0].encode('utf-8')).hexdigest())
+
     done = set() if args.refresh else load_done(args.out)
     skip = set(done)
     if not args.retry_failures:
-        skip |= load_failed(args.failures)
+        skip |= load_failed(args.failures, permanent_only=True)
     todo = [(s, t) for s, t in targets if s not in skip]
     if args.limit:
         todo = todo[:args.limit]
@@ -214,8 +248,12 @@ def main():
     queue = list(todo)
     qlock = threading.Lock()
 
+    deadline = started + args.deadline_minutes * 60 if args.deadline_minutes else 0
+
     def run():
         while True:
+            if deadline and time.time() >= deadline:
+                return
             with qlock:
                 if not queue:
                     return
@@ -236,6 +274,8 @@ def main():
         print('interrupted; rerun to resume', flush=True)
     out.close()
     failures.close()
+    if deadline and time.time() >= deadline:
+        print('deadline reached; rerun to resume', flush=True)
     print('done: ok=%d gone=%d fail=%d in %.1fmin'
           % (state['ok'], state['gone'], state['fail'], (time.time() - started) / 60))
 

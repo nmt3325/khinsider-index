@@ -15,10 +15,19 @@
 # vendor/
 
 scripts/venv
-# album metadata crawl artifacts (published as release assets / CI artifacts)
+__pycache__/
+*.pyc
+
+# metadata pipeline artefacts - these live in GitHub releases, not in git
+album-list.ndjson
+album-list.pages
+album-list-failures.log
+facet-*.ndjson
+facet-*.entities
+facet-*-failures.log
 album-meta.ndjson
 album-meta-failures.log
 library.json
 library.json.gz
-__pycache__/
-*.pyc
+release-notes.md
+residual.txt

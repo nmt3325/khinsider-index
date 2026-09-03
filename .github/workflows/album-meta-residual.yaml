@@ -1,0 +1,132 @@
+# The part the sweeps cannot reach.
+#
+# album-meta.yaml gets platform, type and year for every album and a publisher
+# for ~76% of them out of ~2.8k listing requests. What is left needs one
+# request per album: publishers with fewer than 11 albums (khinsider does not
+# list those on /album-publishers), albums with no publisher at all, and
+# fields that only exist on the album page.
+#
+# So this job is deliberately small and slow: a time-boxed, resumable nibble
+# at the residual queue, ~3 requests per second for 45 minutes, roughly 7k
+# albums per run. It publishes nothing - the state goes back into the
+# crawl-data release and the next sweep folds it into library.json.
+name: Album metadata residual
+
+on:
+  schedule:
+    - cron: "40 15 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Cap the residual queue at N albums (0 = no cap)"
+        default: "0"
+      minutes:
+        description: "Stop crawling after N minutes"
+        default: "45"
+      field:
+        description: "Target albums whose field is still unknown"
+        default: "publishers"
+
+concurrency:
+  group: khinsider-residual
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONUNBUFFERED: "1"
+  GH_TOKEN: ${{ github.token }}
+  LIMIT: ${{ github.event.inputs.limit || '0' }}
+  MINUTES: ${{ github.event.inputs.minutes || '45' }}
+  FIELD: ${{ github.event.inputs.field || 'publishers' }}
+
+jobs:
+  residual:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out scripts and index.json
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts
+            .github
+          sparse-checkout-cone-mode: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r scripts/requirements.txt
+
+      - name: Fetch the crawl state and the current library
+        run: |
+          gh release download crawl-data --pattern '*.gz' --clobber \
+            || echo "no crawl-data release yet"
+          for f in *.gz; do
+            if [ -f "$f" ]; then gunzip -f "$f"; fi
+          done
+          if ! gh release download --pattern 'library.json' --clobber; then
+            echo "no library release yet - building one from the snapshot"
+            python scripts/build_library.py --out library.json
+          fi
+          wc -l album-meta.ndjson 2>/dev/null || echo "no album pages collected yet"
+
+      - name: Pick the residual albums
+        run: |
+          # a missing key in library.json means "never looked"; null or []
+          # means "looked, there is nothing there" and is not re-queued
+          args=(--library library.json --field "$FIELD" --out residual.txt)
+          if [ "$LIMIT" != "0" ]; then args+=(--limit "$LIMIT"); fi
+          python scripts/residual_slugs.py "${args[@]}"
+
+      - name: Crawl residual album pages
+        run: |
+          # --order file keeps residual_slugs.py's ordering: albums new to the
+          # archive first, then a deterministic hash order so successive
+          # time-boxed runs sample the rest evenly
+          python scripts/crawl_album_meta.py \
+            --slugs-file residual.txt --order file \
+            --deadline-minutes "$MINUTES" \
+            --workers 3 --delay 0.9 --jitter 0.6 --retries 4 \
+            --progress-every 200
+
+      - name: Save the crawl state
+        if: always()
+        run: |
+          if ! gh release view crawl-data >/dev/null 2>&1; then
+            gh release create crawl-data --prerelease --title "crawl data" --notes \
+              "Intermediate crawl state shared by the sweep and residual workflows. Not for the relay - use the newest library-* release."
+          fi
+          files=()
+          for f in album-meta.ndjson album-meta-failures.log; do
+            if [ -f "$f" ]; then
+              gzip -kf "$f"
+              files+=("$f.gz")
+            fi
+          done
+          if [ "${#files[@]}" -gt 0 ]; then
+            gh release upload crawl-data "${files[@]}" --clobber
+          fi
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Residual crawl"
+            echo
+            echo "- targeted field: \`$FIELD\`"
+            echo "- residual queue: $(wc -l < residual.txt 2>/dev/null || echo 0) albums"
+            echo "- album pages known in total: $(wc -l < album-meta.ndjson 2>/dev/null || echo 0)"
+            echo
+            echo "The next \`Album metadata sweep\` run folds this into library.json."
+          } >> "$GITHUB_STEP_SUMMARY"
