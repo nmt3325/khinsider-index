@@ -58,7 +58,9 @@ jobs:
           tar xzf /tmp/khrel/crawl_state_snapshot.tar.gz
           gunzip -c /tmp/khrel/wayback_queue_khinsider-track-urls.txt.gz > work/wayback_queue.txt
           touch work/wayback_done.txt work/wayback_failed.txt work/crawl_failures.log
-          wc -l work/wayback_queue.txt work/wayback_queue_crawled.txt work/wayback_done.txt work/crawl_done.txt || true
+          # fresh crawl first (guaranteed current), stale-prone 2023 cache second
+          cat work/wayback_queue_crawled.txt work/wayback_queue.txt > work/queue_submit.txt
+          wc -l work/queue_submit.txt work/wayback_done.txt work/crawl_done.txt || true
 
       - name: Crawl album pages for song URLs (time-boxed)
         env:
@@ -73,6 +75,7 @@ jobs:
           ARCHIVE_ORG_S3_ACCESS: ${{ secrets.ARCHIVE_ORG_S3_ACCESS }}
           ARCHIVE_ORG_S3_SECRET: ${{ secrets.ARCHIVE_ORG_S3_SECRET }}
           SUBMIT_MINUTES: ${{ github.event.inputs.submit_minutes || '270' }}
+          QUEUE_GLOB: work/queue_submit.txt
         run: |
           export SPN2_MAX_SECONDS=$(( ${SUBMIT_MINUTES%.*} * 60 ))
           echo "submit budget: ${SPN2_MAX_SECONDS}s"
