@@ -30,30 +30,36 @@ jobs:
 
       - name: Generate diff
         run: |
-          echo "\`\`\`diff" > changes.md
-          git diff $(git describe --tags --abbrev=0)..HEAD index.json >> changes.md
-          echo "\`\`\`" >> changes.md
+          # a release body is capped at 125,000 characters and index.json is
+          # 15 MB, so the raw diff has to be truncated or the release 422s
+          git diff $(git describe --tags --abbrev=0)..HEAD -- index.json \
+            | head -c 100000 > diff.txt
+          {
+            echo "\`\`\`diff"
+            cat diff.txt
+            echo "\`\`\`"
+          } > changes.md
 
       - name: Compress index
         run: tar -czvf index.tar.gz index.json
 
       - name: Get current date
         id: date
-        run: echo "::set-output name=date::$(date +'%Y-%m-%dT%H:%M:%S%z')" 
+        # ::set-output was removed from Actions, which left the release name
+        # blank
+        run: echo "date=$(date +'%Y-%m-%dT%H:%M:%S%z')" >> "$GITHUB_OUTPUT"
 
       - name: Bump version and push tag
         id: tag_version
         uses: mathieudutour/github-tag-action@v6.0
         with:
-          github_token: ${{ secrets.PAT_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: Index update for ${{ steps.date.outputs.date }}
           body_path: changes.md 
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           files: index.tar.gz
           tag_name: ${{ steps.tag_version.outputs.new_tag }}
-        env:
-          GITHUB_REPOSITORY: marcus-crane/khinsider-index

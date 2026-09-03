@@ -4,6 +4,9 @@ on:
   #   - cron: "0 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   index-sync:
     name: index-sync
@@ -11,13 +14,12 @@ jobs:
     steps:
 
       - name: Checkout
+        # PAT_TOKEN was never set on this fork, so checkout failed on an empty
+        # token. The default credentials plus contents:write are enough here;
+        # the only cost is that this push no longer triggers other workflows.
         uses: actions/checkout@v4
-        with:
-          token: '${{ secrets.PAT_TOKEN }}'
-          # See https://github.community/t/push-from-action-even-with-pat-does-not-trigger-action/17622/6
-          persist-credentials: false
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: 1.17.2
 
@@ -27,11 +29,7 @@ jobs:
 
       - run: cp ~/.cache/khinsider/index.json .
 
-      - name: Commit index changes
-        env:
-          # We use a PAT in order to trigger other workflows on commit
-          # See https://github.community/t/push-from-action-does-not-trigger-subsequent-action/16854/2
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+      - name: Commit and push index changes
         run: |
           set -eux
 
@@ -45,9 +43,4 @@ jobs:
           
           git add .
           git commit -a -m "Index has been updated" || exit 0
-      
-      - name: Push changes
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.PAT_TOKEN }}
-          branch: ${{ github.ref }}
+          git push origin "HEAD:${GITHUB_REF_NAME}"
