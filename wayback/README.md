@@ -12,6 +12,13 @@ registers each one with the Wayback Machine (Save Page Now).
   fingerprint; the site Cloudflare-blocks plain datacenter clients), extracts the
   per-track URLs, and appends them to `work/wayback_queue_crawled.txt`.
   Resumable via `work/crawl_done.txt`. Time-boxed via `CRAWL_MAX_SECONDS`.
+- `direct_links.py` — for every album in `index.json`, fetches the album page plus
+  one track page, learns the `https://<shard>.vgmtreasurechest.com/soundtracks/<album>/<hash>/`
+  prefix and FLAC availability, then constructs every track's direct MP3/FLAC URL
+  (track filename with `%25`->`%` decoding). Sanity-checks the constructed sample URL
+  against the extracted links; albums failing the check are logged to
+  `work/direct_failures.log`. Resumable via `work/direct_done.txt`; time-boxed via
+  `DIRECT_MAX_SECONDS`.
 - `wayback_submit.py` — anonymous SPN submitter (legacy; blocked from datacenter IPs).
 - `spn2_submit.py` — authenticated SPN2 submitter. Requires `ARCHIVE_ORG_S3_ACCESS` /
   `ARCHIVE_ORG_S3_SECRET` (https://archive.org/account/s3.php). Resumable via
@@ -29,8 +36,7 @@ registers each one with the Wayback Machine (Save Page Now).
   https://archive.org/account/s3.php on Colab or a residential IP.
 - Track URLs now serve HTML pages (status 200) embedding the current direct MP3
   link (host migrated: vgmsite.com -> jetta.vgmtreasurechest.com), so track-page
-  captures preserve the pointer to each file. Direct MP3 capture via Wayback is
-  currently unreliable (archive.org fetcher 523s on vgmsite URLs).
+  captures preserve the pointer to each file.
 
 ## Release assets (tag `song-urls-2026-09-01`)
 - `wayback_queue_khinsider-track-urls.txt.gz` — canonical track-page URLs (SPN queue)
@@ -41,16 +47,25 @@ registers each one with the Wayback Machine (Save Page Now).
 ## GitHub Actions (2026-09-03)
 `.github/workflows/wayback-archive.yaml` runs the whole pipeline on GitHub-hosted
 runners: restores state from the `song-urls-2026-09-01` release, crawls album pages
-for song URLs (time-boxed), submits song URLs to the Wayback Machine via SPN2
-(time-boxed), then uploads the updated state back to the release. Runs every 6h
-and on demand (workflow_dispatch with crawl_minutes/submit_minutes inputs).
+for song URLs (time-boxed), generates direct audio-file URLs (time-boxed), submits
+URLs to the Wayback Machine via SPN2 (time-boxed), then uploads the updated state
+back to the release. Runs every 6h and on demand (workflow_dispatch with
+crawl_minutes/direct_minutes/submit_minutes inputs).
 SPN2 verified working from GitHub runner IPs on 2026-09-03 (the 2026-09-01 block
 was transient). Requires repo secrets `ARCHIVE_ORG_S3_ACCESS` / `ARCHIVE_ORG_S3_SECRET`.
 
 Notes:
 - The 2023-cached queue (~1.31M URLs) is partially stale: ~25% 404 on the live site
-  in a 12-URL sample (re-ripped/expanded albums renamed tracks). The workflow builds
-  `work/queue_submit.txt` with freshly crawled URLs FIRST and cached URLs second.
+  in a 12-URL sample (re-ripped/expanded albums renamed tracks). The submission queue
+  is built as: freshly crawled track pages first, generated direct file URLs second,
+  cached track pages last.
 - SPN2 acceptance (HTTP 200 + job_id) is what the submitter tracks; capture jobs that
   end as not-found for stale URLs are harmless and visible only via the SPN2 status
   endpoint / CDX after the fact.
+- `capture_outlinks=1` was tested (2026-09-03): the track-page capture succeeds but
+  the job reports `outlinks: 0` — Wayback does NOT capture the audio files linked on
+  the page. Direct file URLs must be submitted as their own queue entries instead.
+  Direct MP3 submission verified end-to-end (archived file downloaded back from
+  web.archive.org as valid audio/mpeg).
+- The 2023 cache's vgmsite.com direct URLs are unusable (TLS certificate broken;
+  the host migrated to *.vgmtreasurechest.com).

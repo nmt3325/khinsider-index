@@ -7,11 +7,15 @@ on:
     inputs:
       crawl_minutes:
         description: "Minutes to crawl album pages for song URLs (0 = skip)"
-        default: "30"
+        default: "20"
+        required: false
+      direct_minutes:
+        description: "Minutes to generate direct audio-file URLs (0 = skip)"
+        default: "60"
         required: false
       submit_minutes:
-        description: "Minutes to submit song URLs to the Wayback Machine"
-        default: "270"
+        description: "Minutes to submit URLs to the Wayback Machine"
+        default: "260"
         required: false
 
 permissions:
@@ -28,13 +32,14 @@ jobs:
   archive:
     name: wayback-archive
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 355
     steps:
-      - name: Checkout (wayback scripts only)
+      - name: Checkout (scripts + index)
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             wayback
+            index.json
           sparse-checkout-cone-mode: false
 
       - name: Set up Python
@@ -57,26 +62,35 @@ jobs:
             --dir /tmp/khrel --clobber
           tar xzf /tmp/khrel/crawl_state_snapshot.tar.gz
           gunzip -c /tmp/khrel/wayback_queue_khinsider-track-urls.txt.gz > work/wayback_queue.txt
-          touch work/wayback_done.txt work/wayback_failed.txt work/crawl_failures.log
-          # fresh crawl first (guaranteed current), stale-prone 2023 cache second
-          cat work/wayback_queue_crawled.txt work/wayback_queue.txt > work/queue_submit.txt
-          wc -l work/queue_submit.txt work/wayback_done.txt work/crawl_done.txt || true
+          touch work/wayback_done.txt work/wayback_failed.txt work/crawl_failures.log \
+                work/direct_done.txt work/direct_failures.log work/direct_queue.txt work/direct_links.jsonl
+          wc -l work/*.txt | tail -10 || true
 
       - name: Crawl album pages for song URLs (time-boxed)
         env:
-          CRAWL_MINUTES: ${{ github.event.inputs.crawl_minutes || '30' }}
+          CRAWL_MINUTES: ${{ github.event.inputs.crawl_minutes || '20' }}
         run: |
           export CRAWL_MAX_SECONDS=$(( ${CRAWL_MINUTES%.*} * 60 ))
           echo "crawl budget: ${CRAWL_MAX_SECONDS}s"
           python wayback/crawl_songs.py
 
-      - name: Submit song URLs to Wayback Machine (time-boxed)
+      - name: Generate direct audio-file URLs (time-boxed)
+        env:
+          DIRECT_MINUTES: ${{ github.event.inputs.direct_minutes || '60' }}
+        run: |
+          export DIRECT_MAX_SECONDS=$(( ${DIRECT_MINUTES%.*} * 60 ))
+          echo "direct budget: ${DIRECT_MAX_SECONDS}s"
+          python wayback/direct_links.py
+
+      - name: Submit URLs to Wayback Machine (time-boxed)
         env:
           ARCHIVE_ORG_S3_ACCESS: ${{ secrets.ARCHIVE_ORG_S3_ACCESS }}
           ARCHIVE_ORG_S3_SECRET: ${{ secrets.ARCHIVE_ORG_S3_SECRET }}
-          SUBMIT_MINUTES: ${{ github.event.inputs.submit_minutes || '270' }}
+          SUBMIT_MINUTES: ${{ github.event.inputs.submit_minutes || '260' }}
           QUEUE_GLOB: work/queue_submit.txt
         run: |
+          cat work/wayback_queue_crawled.txt work/direct_queue.txt work/wayback_queue.txt > work/queue_submit.txt
+          wc -l work/queue_submit.txt
           export SPN2_MAX_SECONDS=$(( ${SUBMIT_MINUTES%.*} * 60 ))
           echo "submit budget: ${SPN2_MAX_SECONDS}s"
           python wayback/spn2_submit.py
@@ -90,5 +104,7 @@ jobs:
           tar czf /tmp/khrel/crawl_state_snapshot.tar.gz \
             work/missing_slugs.txt work/crawl_done.txt work/crawl_failures.log \
             work/wayback_done.txt work/wayback_failed.txt \
-            work/songs_crawled.jsonl work/wayback_queue_crawled.txt
+            work/songs_crawled.jsonl work/wayback_queue_crawled.txt \
+            work/direct_done.txt work/direct_failures.log \
+            work/direct_links.jsonl work/direct_queue.txt
           gh release upload song-urls-2026-09-01 /tmp/khrel/crawl_state_snapshot.tar.gz --clobber
