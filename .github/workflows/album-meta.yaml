@@ -1,15 +1,4 @@
-# Listing + facet sweep: the cheap way to get metadata for the whole archive.
-#
-# /game-soundtracks?page=N is a 500-row table of every album with Platform,
-# Type and Year already in it, so 210 requests cover all ~104k albums. The
-# publisher and developer facet pages are the same table, so ~2.6k more
-# requests assign a company to roughly three quarters of the archive.
-#
-# That is ~2.8k requests instead of ~104k, which is why this fits in one job
-# with no sharding, no self-dispatch and no cache juggling - it finishes in
-# well under an hour. Anything the sweeps cannot reach (companies with fewer
-# than 11 albums, and fields that only exist on the album page such as date
-# added or track count) is left to album-meta-residual.yaml.
+# Listing + facet sweep plus recent discovery for metadata publication.
 name: Album metadata sweep
 
 on:
@@ -17,15 +6,22 @@ on:
     - cron: "20 3 * * *"
   workflow_dispatch:
     inputs:
+      full_reconcile:
+        description: "Force a full listing + facet reconciliation"
+        type: boolean
+        default: true
       list_pages:
-        description: "Limit the listing sweep to N pages (0 = all)"
-        default: "0"
+        description: 'Maximum new listing pages per full run (0 = unlimited)'
+        type: string
+        default: '0'
       publisher_limit:
-        description: "Limit the publisher sweep to N companies (0 = all)"
-        default: "0"
+        description: 'Maximum publishers per full run (0 = unlimited)'
+        type: string
+        default: '0'
       developer_limit:
-        description: "Limit the developer sweep to N companies (0 = all)"
-        default: "0"
+        description: 'Maximum developers per full run (0 = unlimited)'
+        type: string
+        default: '0'
       publish:
         description: "Publish a library.json release"
         type: boolean
@@ -45,6 +41,7 @@ defaults:
 env:
   PYTHONUNBUFFERED: "1"
   GH_TOKEN: ${{ github.token }}
+  FORCE_FULL: ${{ github.event.inputs.full_reconcile || 'false' }}
   LIST_PAGES: ${{ github.event.inputs.list_pages || '0' }}
   PUBLISHER_LIMIT: ${{ github.event.inputs.publisher_limit || '0' }}
   DEVELOPER_LIMIT: ${{ github.event.inputs.developer_limit || '0' }}
@@ -54,12 +51,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-      - name: Check out scripts and index.json
+      - name: Check out scripts, workflows and index.json
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             scripts
             .github
+            index.json
           sparse-checkout-cone-mode: true
 
       - name: Set up Python
@@ -72,52 +70,114 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check -r scripts/requirements-meta.txt
 
-      - name: Carry over album-page metadata
+      - name: Restore crawl-data snapshot
+        id: restore
         run: |
-          # album pages cost one request each, so never throw away what the
-          # residual workflow already collected
-          gh release download crawl-data --pattern 'album-meta*.gz' --clobber \
-            || echo "no crawl-data release yet - starting from nothing"
-          for f in album-meta.ndjson.gz album-meta-failures.log.gz; do
-            if [ -f "$f" ]; then gunzip -f "$f"; fi
+          set -euo pipefail
+          bootstrap=false
+          lookup_stderr=$(mktemp)
+          trap 'rm -f "$lookup_stderr"' EXIT
+          if gh release view crawl-data >/dev/null 2>"$lookup_stderr"; then
+            gh release download crawl-data --pattern '*.gz' --clobber
+            for f in *.gz; do
+              if [ -f "$f" ]; then gunzip -f "$f"; fi
+            done
+          elif grep -Eiq 'HTTP 404|404 Not Found|release not found|could not resolve to a Release' "$lookup_stderr"; then
+            bootstrap=true
+          else
+            cat "$lookup_stderr" >&2
+            exit 1
+          fi
+          touch recent-state.json recent-albums.ndjson recent-slugs.txt album-list.pages
+          echo "bootstrap=$bootstrap" >> "$GITHUB_OUTPUT"
+
+
+      - name: Restore the current published library
+        run: |
+          if gh release download --pattern library.json --dir published --clobber; then
+            mv published/library.json published-library.json
+          else
+            echo "no published library yet"
+          fi
+
+      - name: Decide whether this run must reconcile the full baseline
+        id: mode
+        run: |
+          set -euo pipefail
+          full=false
+          reason=incremental
+          if [ "$FORCE_FULL" = "true" ] || [ "$LIST_PAGES" != "0" ] || [ "$PUBLISHER_LIMIT" != "0" ] || [ "$DEVELOPER_LIMIT" != "0" ]; then
+            full=true
+            reason=manual
+          elif [ "${{ steps.restore.outputs.bootstrap }}" = "true" ]; then
+            full=true
+            reason=bootstrap
+          elif compgen -G 'album-list-staging*' >/dev/null || compgen -G 'facet-*-staging*' >/dev/null; then
+            full=true
+            reason=resume
+          elif [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%u)" = "1" ]; then
+            full=true
+            reason=weekly
+          fi
+          for f in album-list.ndjson facet-publisher.ndjson facet-developer.ndjson \
+                   facet-publisher-stats.ndjson facet-developer-stats.ndjson; do
+            if [ ! -s "$f" ]; then
+              full=true
+              reason=bootstrap
+              break
+            fi
           done
-          wc -l album-meta.ndjson 2>/dev/null || echo "0 album pages carried over"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "mode: $reason" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Sweep the flat album list
-        continue-on-error: true
+      - name: Discover recent homepage changes
         run: |
-          args=(--fresh --deadline-minutes 45)
-          if [ "$LIST_PAGES" != "0" ]; then args+=(--max-pages "$LIST_PAGES"); fi
-          python scripts/crawl_index_pages.py "${args[@]}"
+          python scripts/crawl_recent.py \
+            --state recent-state.json \
+            --out recent-albums.ndjson \
+            --queue recent-slugs.txt \
+            --metadata album-meta.ndjson \
+            --overlap-days 3 \
+            --max-pages 10 \
+            --deadline-minutes 5
 
-      - name: Sweep publisher facets
-        continue-on-error: true
-        run: |
-          args=(--kind publisher --fresh --deadline-minutes 90)
-          if [ "$PUBLISHER_LIMIT" != "0" ]; then args+=(--limit "$PUBLISHER_LIMIT"); fi
-          python scripts/crawl_facets.py "${args[@]}"
+      - name: Reconcile the full album list
+        if: steps.mode.outputs.full == 'true'
+        run: python scripts/crawl_index_pages.py --max-pages "$LIST_PAGES" --fresh --deadline-minutes 45
 
-      - name: Sweep developer facets
-        continue-on-error: true
+      - name: Reconcile publisher facets
+        if: steps.mode.outputs.full == 'true'
+        run: python scripts/crawl_facets.py --limit "$PUBLISHER_LIMIT" --kind publisher --fresh --deadline-minutes 90
+
+      - name: Reconcile developer facets
+        if: steps.mode.outputs.full == 'true'
+        run: python scripts/crawl_facets.py --limit "$DEVELOPER_LIMIT" --kind developer --fresh --deadline-minutes 60
+
+      - name: Crawl metadata for recently changed albums
+        if: hashFiles('recent-slugs.txt') != ''
         run: |
-          args=(--kind developer --fresh --deadline-minutes 60)
-          if [ "$DEVELOPER_LIMIT" != "0" ]; then args+=(--limit "$DEVELOPER_LIMIT"); fi
-          python scripts/crawl_facets.py "${args[@]}"
+          python scripts/crawl_album_meta.py \
+            --slugs-file recent-slugs.txt \
+            --refresh \
+            --retry-failures \
+            --order file
+
+      - name: Acknowledge recently refreshed albums
+        if: ${{ success() && hashFiles('recent-slugs.txt') != '' }}
+        run: |
+          python scripts/crawl_recent.py \
+            --ack-only \
+            --state recent-state.json \
+            --out recent-albums.ndjson \
+            --queue recent-slugs.txt \
+            --metadata album-meta.ndjson
 
       - name: Build library.json
         run: |
-          # a sweep step is allowed to fail; these gates are what actually
-          # decides whether the result is fit to publish
-          gate_list=97
-          gate_pub=55
-          if [ "$LIST_PAGES" != "0" ] || [ "$PUBLISHER_LIMIT" != "0" ] \
-             || [ "$DEVELOPER_LIMIT" != "0" ]; then
-            gate_list=0
-            gate_pub=0
-          fi
-          python scripts/build_library.py --gzip \
-            --min-list-coverage "$gate_list" \
-            --min-publisher-coverage "$gate_pub"
+          python scripts/build_library.py --recent recent-albums.ndjson --gzip \
+            --min-list-coverage 97 \
+            --min-publisher-coverage 55
 
       - name: Summarise coverage
         if: always()
@@ -129,21 +189,31 @@ jobs:
             echo "no library.json was built" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Publish the library release
-        if: ${{ github.event.inputs.publish != 'false' }}
+      - name: Compare library content with the current release
+        id: compare
         run: |
-          tag="library-$(date -u +%Y%m%d-%H%M)"
-          # draft, then upload, then publish: the release only becomes "latest"
-          # once both assets are complete, so a relay pulling
-          # releases/latest/download/library.json never sees a half-written file
+          args=(library-changed --current library.json --github-output "$GITHUB_OUTPUT")
+          if [ -f published-library.json ]; then
+            args+=(--previous published-library.json)
+          fi
+          python scripts/publication.py "${args[@]}"
+
+      - name: Publish the library release
+        if: ${{ github.event.inputs.publish != 'false' && steps.compare.outputs.changed == 'true' }}
+        run: |
+          tag="library-$(date -u +%Y%m%d-%H%M)-${GITHUB_RUN_ID}"
           gh release create "$tag" --draft --title "$tag" --notes-file release-notes.md
           gh release upload "$tag" library.json library.json.gz
           gh release edit "$tag" --draft=false --latest
           echo "published [$tag](https://github.com/${GITHUB_REPOSITORY}/releases/tag/$tag)" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Skip publish when the content is unchanged
+        if: steps.compare.outputs.changed != 'true'
+        run: echo "library content unchanged; skipped release creation" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Keep only the newest seven library releases
-        if: ${{ github.event.inputs.publish != 'false' }}
+        if: ${{ github.event.inputs.publish != 'false' && steps.compare.outputs.changed == 'true' }}
         run: |
           gh release list --limit 100 --json tagName,createdAt,isDraft --jq '
             [.[] | select(.isDraft == false) | select(.tagName | startswith("library-"))]
@@ -153,20 +223,33 @@ jobs:
           done < stale.txt
 
       - name: Refresh the crawl-data snapshot
-        if: always()
+        if: ${{ always() && steps.restore.outcome == 'success' }}
         run: |
+          set -euo pipefail
           if ! gh release view crawl-data >/dev/null 2>&1; then
             gh release create crawl-data --prerelease --title "crawl data" --notes \
-              "Intermediate crawl state shared by the sweep and residual workflows. Not for the relay - use the newest library-* release."
+              "Intermediate crawl state shared by the sweep, residual, song-index and wayback workflows."
           fi
           files=()
-          for f in album-list.ndjson facet-publisher.ndjson facet-developer.ndjson \
-                   facet-publisher-stats.ndjson facet-developer-stats.ndjson; do
-            if [ -f "$f" ]; then
-              gzip -kf "$f"
+          for f in album-meta.ndjson album-meta-failures.log metadata-progress.json \
+                   album-list* facet-publisher* facet-developer* \
+                   recent-state.json recent-albums.ndjson recent-slugs.txt; do
+            if [ -f "$f" ] && [[ "$f" != *.gz && "$f" != *.tmp && "$f" != *.bak ]]; then
+              gzip -nkf "$f"
               files+=("$f.gz")
             fi
           done
           if [ "${#files[@]}" -gt 0 ]; then
             gh release upload crawl-data "${files[@]}" --clobber
+            # Completed staging generations must not reappear on the next restore.
+            gh release view crawl-data --json assets --jq '.assets[].name' > checkpoint-assets.txt
+            while IFS= read -r asset; do
+              case "$asset" in
+                album-list*staging*.gz|facet-publisher*staging*.gz|facet-developer*staging*.gz)
+                  if [ ! -f "${asset%.gz}" ]; then
+                    gh release delete-asset crawl-data "$asset" --yes
+                  fi
+                  ;;
+              esac
+            done < checkpoint-assets.txt
           fi

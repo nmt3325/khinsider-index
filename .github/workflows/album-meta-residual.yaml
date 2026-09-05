@@ -1,7 +1,4 @@
 # Fetch every individual album page, even when listing/facet metadata exists.
-# Existing page records and permanent unavailable pages are skipped on resume.
-# Four-hour runs, scheduled every four hours, replace the old 45-minute daily
-# publisher-only queue. Checkpoint every 30 minutes and publish each batch.
 name: Album metadata full backfill
 
 on:
@@ -13,8 +10,6 @@ on:
         description: "Crawl time budget in minutes (1-240)"
         default: "240"
 
-# The sweep reads these same release assets and also publishes library.json.
-# Serialize both workflows to avoid reading a checkpoint while it is replaced.
 concurrency:
   group: khinsider-metadata
   cancel-in-progress: false
@@ -36,12 +31,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
-      - name: Check out scripts and index.json
+      - name: Check out scripts, workflows and index.json
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             scripts
             .github
+            index.json
           sparse-checkout-cone-mode: true
 
       - name: Set up Python
@@ -66,17 +62,17 @@ jobs:
           print(f'MINUTES={minutes}')
           PY
 
-      - name: Restore the checkpoint and current catalog
+      - name: Restore the checkpoint, recent state and current catalog
         id: restore
         run: |
-          # Fail closed: a download problem must not restart from empty state
-          # and then overwrite the already collected records.
+          set -euo pipefail
           gh release download crawl-data --pattern '*.gz' --clobber
           for f in *.gz; do
             if [ -f "$f" ]; then gunzip -f "$f"; fi
           done
           test -s album-meta.ndjson
           gh release download --pattern library.json --clobber
+          touch recent-state.json recent-albums.ndjson recent-slugs.txt album-list.pages
 
       - name: Measure initial full-catalog coverage
         id: before
@@ -95,9 +91,6 @@ jobs:
             seconds_left=$((deadline - SECONDS))
             if [ "$seconds_left" -le 0 ]; then break; fi
             slice=$(python -c 'import sys; print(min(1800, int(sys.argv[1])) / 60)' "$seconds_left")
-
-            # The entire current library is the target, NOT a missing-field
-            # filter. The crawler itself skips fetched/permanently gone slugs.
             python scripts/crawl_album_meta.py \
               --index library.json --order hash \
               --deadline-minutes "$slice" \
@@ -105,9 +98,11 @@ jobs:
               --progress-every 200
 
             files=()
-            for f in album-meta.ndjson album-meta-failures.log; do
-              if [ -f "$f" ]; then
-                gzip -kf "$f"
+            for f in album-meta.ndjson album-meta-failures.log metadata-progress.json \
+                     album-list* facet-publisher* facet-developer* \
+                     recent-state.json recent-albums.ndjson recent-slugs.txt; do
+              if [ -f "$f" ] && [[ "$f" != *.gz && "$f" != *.tmp && "$f" != *.bak ]]; then
+                gzip -nkf "$f"
                 files+=("$f.gz")
               fi
             done
@@ -126,9 +121,11 @@ jobs:
         if: ${{ always() && steps.restore.outcome == 'success' }}
         run: |
           files=()
-          for f in album-meta.ndjson album-meta-failures.log; do
-            if [ -f "$f" ]; then
-              gzip -kf "$f"
+          for f in album-meta.ndjson album-meta-failures.log metadata-progress.json \
+                   album-list* facet-publisher* facet-developer* \
+                   recent-state.json recent-albums.ndjson recent-slugs.txt; do
+            if [ -f "$f" ] && [[ "$f" != *.gz && "$f" != *.tmp && "$f" != *.bak ]]; then
+              gzip -nkf "$f"
               files+=("$f.gz")
             fi
           done
@@ -145,20 +142,35 @@ jobs:
       - name: Build the updated library
         if: ${{ success() && steps.after.outputs.fetched != '' && steps.before.outputs.published_fetched != '' && fromJSON(steps.after.outputs.fetched) > fromJSON(steps.before.outputs.published_fetched) }}
         run: |
-          # Keep the listing/facet coverage gates: partial or broken inputs
-          # must never replace the working relay library.
-          python scripts/build_library.py --out library-next.json --gzip \
+          python scripts/build_library.py --out library-next.json --recent recent-albums.ndjson --gzip \
             --min-list-coverage 97 --min-publisher-coverage 55
           python scripts/release_notes.py --library library-next.json \
             --out release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compare the rebuilt library with the current release
+        id: compare
+        if: ${{ success() && hashFiles('library-next.json') != '' }}
+        run: |
+          python scripts/publication.py library-changed \
+            --current library-next.json \
+            --previous library.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Promote the rebuilt library
+        if: ${{ steps.compare.outputs.changed == 'true' }}
+        run: |
           mv library-next.json library.json
           mv library-next.json.gz library.json.gz
 
       - name: Publish the updated library atomically
-        if: ${{ success() && steps.after.outputs.fetched != '' && steps.before.outputs.published_fetched != '' && fromJSON(steps.after.outputs.fetched) > fromJSON(steps.before.outputs.published_fetched) }}
+        if: ${{ steps.compare.outputs.changed == 'true' }}
         run: |
           tag="library-$(date -u +%Y%m%d-%H%M)-${GITHUB_RUN_ID}"
           gh release create "$tag" --draft --title "$tag" --notes-file release-notes.md
           gh release upload "$tag" library.json library.json.gz
           gh release edit "$tag" --draft=false --latest
           echo "Published $tag" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Skip publish when the rebuilt content is unchanged
+        if: ${{ hashFiles('library-next.json') != '' && steps.compare.outputs.changed != 'true' }}
+        run: echo "library content unchanged; skipped release creation" >> "$GITHUB_STEP_SUMMARY"

@@ -27,6 +27,7 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: 1
+  METADATA_FILE: album-meta.ndjson
 
 jobs:
   archive:
@@ -34,11 +35,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: Checkout (scripts + index)
+      - name: Checkout (wayback, scripts, index)
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             wayback
+            scripts
             index.json
           sparse-checkout-cone-mode: false
 
@@ -48,13 +50,15 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install curl_cffi requests
+        run: |
+          python -m pip install --disable-pip-version-check -r scripts/requirements-meta.txt requests
 
-      - name: Restore state from release
+      - name: Restore state from releases
+        id: restore
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -eux
+          set -euo pipefail
           mkdir -p work /tmp/khrel
           gh release download song-urls-2026-09-01 \
             --pattern 'crawl_state_snapshot.tar.gz' \
@@ -62,6 +66,9 @@ jobs:
             --dir /tmp/khrel --clobber
           tar xzf /tmp/khrel/crawl_state_snapshot.tar.gz
           gunzip -c /tmp/khrel/wayback_queue_khinsider-track-urls.txt.gz > work/wayback_queue.txt
+          gh release download crawl-data --pattern 'album-meta.ndjson*' --clobber
+          if [ -f album-meta.ndjson.gz ]; then gunzip -f album-meta.ndjson.gz; fi
+          test -s album-meta.ndjson
           touch work/wayback_done.txt work/wayback_failed.txt work/crawl_failures.log \
                 work/direct_done.txt work/direct_failures.log work/direct_queue.txt work/direct_links.jsonl
           wc -l work/*.txt | tail -10 || true
@@ -96,15 +103,25 @@ jobs:
           python wayback/spn2_submit.py
 
       - name: Persist state to release
-        if: always()
+        if: ${{ always() && steps.restore.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -ux
-          tar czf /tmp/khrel/crawl_state_snapshot.tar.gz \
-            work/missing_slugs.txt work/crawl_done.txt work/crawl_failures.log \
-            work/wayback_done.txt work/wayback_failed.txt \
-            work/songs_crawled.jsonl work/wayback_queue_crawled.txt \
-            work/direct_done.txt work/direct_failures.log \
-            work/direct_links.jsonl work/direct_queue.txt
+          set -euo pipefail
+          files=()
+          for f in work/missing_slugs.txt work/crawl_done.txt work/crawl_failures.log \
+                   work/wayback_done.txt work/wayback_failed.txt \
+                   work/songs_crawled.jsonl work/wayback_queue_crawled.txt \
+                   work/direct_done.txt work/direct_failures.log \
+                   work/direct_links.jsonl work/direct_queue.txt; do
+            if [ -f "$f" ]; then
+              files+=("$f")
+            fi
+          done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no restored state files were available to persist" >&2
+            exit 1
+          fi
+          tar czf /tmp/khrel/crawl_state_snapshot.tar.gz "${files[@]}"
+          test -s /tmp/khrel/crawl_state_snapshot.tar.gz
           gh release upload song-urls-2026-09-01 /tmp/khrel/crawl_state_snapshot.tar.gz --clobber

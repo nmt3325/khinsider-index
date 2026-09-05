@@ -1,0 +1,75 @@
+[
+  [
+    {
+      "slug": "friday-night-funkin-viernes-noche-webiando-windows-gamerip-2021",
+      "title": "Friday Night Funkin' - Viernes Noche Webiando'",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Gamerip",
+      "year": 2021
+    },
+    {
+      "slug": "sherlock-holmes-nemesis-2010",
+      "title": "Sherlock Holmes: Nemesis",
+      "platforms": [
+        "Steam",
+        "Windows"
+      ],
+      "album_type": "Soundtrack",
+      "year": 2010
+    },
+    {
+      "slug": "kokonatsu-kokonatsu-best-2021",
+      "title": "Kokonatsu / Kokonatsu BEST",
+      "platforms": [],
+      "album_type": "Soundtrack",
+      "year": 2021
+    },
+    {
+      "slug": "chicken-steam-windows-gamerip-2024",
+      "title": "Chicken",
+      "platforms": [
+        "Steam",
+        "Windows"
+      ],
+      "album_type": "Gamerip",
+      "year": 2024
+    },
+    {
+      "slug": "floating-point-linux-macos-steam-windows-gamerip-2014",
+      "title": "Floating Point",
+      "platforms": [
+        "Linux",
+        "MacOS",
+        "Steam",
+        "Windows"
+      ],
+      "album_type": "Gamerip",
+      "year": 2014
+    },
+    {
+      "slug": "pocket-academy-zero-android-ios-ps4-switch-gamerip-2012",
+      "title": "Pocket Academy ZERO",
+      "platforms": [
+        "Android",
+        "iOS",
+        "PS4",
+        "Switch"
+      ],
+      "album_type": "Gamerip",
+      "year": 2012
+    },
+    {
+      "slug": "mianbao-fang-shaonü-withered-2009",
+      "title": "Mianbao Fang Shaonü ~ Withered",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Soundtrack",
+      "year": 2009
+    }
+  ],
+  210,
+  104616
+]

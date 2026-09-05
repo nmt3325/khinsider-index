@@ -1,82 +1,229 @@
-import json, re, os, time, random
+#!/usr/bin/env python3
+import gzip
+import json
+import os
+import random
+import re
+import time
+import urllib.parse
+import urllib.parse as _urlparse
+
+from bs4 import BeautifulSoup
 from curl_cffi import requests as cr
 
-# Generates direct audio-file URLs (MP3/FLAC on *.vgmtreasurechest.com) for every
-# track of every album in index.json. Per album: fetch the album page (current
-# track list) plus one track page to learn the direct-URL prefix (shard + per-album
-# hash) and FLAC availability, then construct all tracks' direct URLs by mapping the
-# track-URL filename encoding (%25XX -> %XX). Resumable via work/direct_done.txt.
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
+import album_meta
+from khinsider_player import extract_player_urls, valid_mp3_url
 
 BASE = 'https://downloads.khinsider.com'
 DONE_FILE = 'work/direct_done.txt'
 OUT_FILE = 'work/direct_links.jsonl'
 QUEUE_FILE = 'work/direct_queue.txt'
 FAIL_FILE = 'work/direct_failures.log'
+METADATA_FILE = os.environ.get('METADATA_FILE', 'album-meta.ndjson')
 MAX_SECONDS = int(os.environ.get('DIRECT_MAX_SECONDS', '0') or 0)
-deadline = time.time() + MAX_SECONDS if MAX_SECONDS > 0 else None
+SCHEMA_VERSION = 2
+LINK_PAT = re.compile(r"https?://[a-z0-9.-]*vgmtreasurechest\.com/soundtracks/[^\"' <>]+\.(?:mp3|flac)", re.I)
 
-done = set(open(DONE_FILE).read().split()) if os.path.exists(DONE_FILE) else set()
-idx = json.load(open('index.json'))
-slugs = []
-for v in idx['entries'].values():
-    s = v.rsplit('/', 1)[-1]
-    if s not in done:
-        slugs.append(s)
-print(f'todo: {len(slugs)} (already done: {len(done)})', flush=True)
 
-out = open(OUT_FILE, 'a', buffering=1)
-que = open(QUEUE_FILE, 'a', buffering=1)
-dn = open(DONE_FILE, 'a', buffering=1)
-fl = open(FAIL_FILE, 'a', buffering=1)
+def open_jsonl(path):
+    return gzip.open(path, 'rt', encoding='utf-8') if str(path).endswith('.gz') else open(path, encoding='utf-8')
 
-sess = cr.Session(impersonate='chrome')
-link_pat = re.compile(r"https?://([a-z0-9.-]+vgmtreasurechest\.com)/soundtracks/([^/\"' <>]+)/([^/\"' <>]+)/([^/\"' <>]+?)\.(mp3|flac)", re.I)
 
-for i, slug in enumerate(slugs, 1):
-    if deadline and time.time() > deadline:
-        print('DIRECT time box reached', flush=True)
-        break
-    time.sleep(0.4 + random.random() * 0.6)
+def load_done_from_output(path):
+    done = set()
+    if not os.path.exists(path):
+        return done
+    with open(path, encoding='utf-8') as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get('schema_version') == SCHEMA_VERSION and rec.get('status') == 'ok' and rec.get('album'):
+                done.add(rec['album'])
+    return done
+
+
+def load_metadata(path):
+    out = {}
+    if not path or not os.path.exists(path):
+        return out
+    seq = 0
+    with open_jsonl(path) as fh:
+        for line in fh:
+            seq += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            slug = rec.get('slug')
+            tracks = rec.get('tracks')
+            if not slug or rec.get('tracks_complete') is not True or not isinstance(tracks, list) or not tracks:
+                continue
+            prev = out.get(slug)
+            cur_key = (str(rec.get('crawled_at') or ''), seq)
+            prev_key = (str((prev or {}).get('crawled_at') or ''), (prev or {}).get('_seq', -1))
+            if prev is None or cur_key >= prev_key:
+                copy = dict(rec)
+                copy['_seq'] = seq
+                out[slug] = copy
+    return out
+
+
+def valid_audio_url(url, slug):
+    if not isinstance(url, str) or not isinstance(slug, str):
+        return False
     try:
-        ra = sess.get(f'{BASE}/game-soundtracks/album/{slug}', timeout=30)
-        if ra.status_code != 200:
-            fl.write(f'{slug}\talbum HTTP {ra.status_code}\n')
-            dn.write(slug + '\n')
-            continue
-        tracks = sorted(set(re.findall(r'href="(/game-soundtracks/album/' + re.escape(slug) + r'/([^"]+))"', ra.text)))
-        if not tracks:
-            fl.write(f'{slug}\tno tracks\n')
-            dn.write(slug + '\n')
-            continue
-        rt = sess.get(BASE + tracks[0][0], timeout=30)
-        links = link_pat.findall(rt.text)
-        if not links:
-            fl.write(f'{slug}\tno direct links\n')
-            dn.write(slug + '\n')
-            continue
-        host, galbum, ghash = links[0][0], links[0][1], links[0][2]
-        has_flac = any(l[4].lower() == 'flac' for l in links)
-        got = set()
-        for h, ga, gh, fn, ext in links:
-            got.add(('https://%s/soundtracks/%s/%s/%s.%s' % (h, ga, gh, fn, ext)).lower())
-        sample_name = tracks[0][1].replace('%25', '%')
-        expect = ('https://%s/soundtracks/%s/%s/%s' % (host, galbum, ghash, sample_name)).lower()
-        if expect not in got:
-            fl.write(f'{slug}\tmapping mismatch: {sample_name}\n')
-            dn.write(slug + '\n')
-            continue
-        n = 0
-        for _path, fname in tracks:
-            name = fname.replace('%25', '%')
-            base = 'https://%s/soundtracks/%s/%s/%s' % (host, galbum, ghash, name)
-            que.write(base + '\n')
-            if has_flac:
-                que.write(base.rsplit('.', 1)[0] + '.flac\n')
-            n += 1
-        out.write(json.dumps({'album': slug, 'host': host, 'hash': ghash, 'has_flac': has_flac, 'tracks': n}, ensure_ascii=False) + '\n')
-    except Exception as e:
-        fl.write(f'{slug}\t{type(e).__name__}\n')
-    dn.write(slug + '\n')
-    if i % 50 == 0:
-        print(f'[{i}/{len(slugs)}] {slug}', flush=True)
-print('DIRECT EXIT', flush=True)
+        parsed = _urlparse.urlsplit(url)
+        host = parsed.hostname or ''
+        pieces = parsed.path.strip('/').split('/')
+        if parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port not in (None, 443):
+            return False
+        if host != 'vgmtreasurechest.com' and not host.endswith('.vgmtreasurechest.com'):
+            return False
+        if len(pieces) < 4 or pieces[0] != 'soundtracks':
+            return False
+        if urllib.parse.unquote(pieces[1]) != urllib.parse.unquote(slug):
+            return False
+        ext = urllib.parse.unquote(pieces[-1]).lower()
+        return ext.endswith('.mp3') or ext.endswith('.flac')
+    except ValueError:
+        return False
+
+
+def extract_direct_links(html, slug):
+    seen, out = set(), []
+    for url in LINK_PAT.findall(html or ''):
+        if valid_audio_url(url, slug):
+            low = url.lower()
+            if low not in seen:
+                seen.add(low)
+                out.append(url)
+    return out
+
+
+def track_page_url(slug, basename):
+    return album_meta.song_page_url(slug, basename, base=BASE)
+
+
+def tracks_from_album_html(slug, html):
+    soup = BeautifulSoup(html, 'html.parser')
+    player_urls = extract_player_urls(html, slug)
+    return album_meta.parse_songlist(soup, slug, player_urls=player_urls)
+
+
+def fetch_text(sess, url):
+    r = sess.get(url, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError('HTTP %s for %s' % (r.status_code, url))
+    return r.text
+
+
+def resolve_track_urls(sess, slug, track):
+    urls = []
+    page_url = track_page_url(slug, track['basename'])
+    mp3 = track.get('mp3_url')
+    if valid_mp3_url(mp3, slug):
+        urls.append(mp3)
+    need_song_page = not urls or any(fmt != 'mp3' for fmt in track.get('formats', []))
+    fetched = 0
+    if need_song_page:
+        fetched = 1
+        song_html = fetch_text(sess, page_url)
+        direct = extract_direct_links(song_html, slug)
+        if direct:
+            for url in direct:
+                if url not in urls:
+                    urls.append(url)
+        elif page_url not in urls:
+            urls.append(page_url)
+    return urls, fetched
+
+
+def process_album(sess, slug, metadata_rec=None):
+    used_metadata = metadata_rec is not None
+    if metadata_rec is not None:
+        tracks = metadata_rec.get('tracks') or []
+    else:
+        tracks = tracks_from_album_html(slug, fetch_text(sess, f'{BASE}/game-soundtracks/album/{slug}'))
+    if not tracks:
+        raise RuntimeError('no tracks')
+    queue = []
+    seen = set()
+    fetched_song_pages = 0
+    mp3_tracks = 0
+    for track in tracks:
+        urls, fetched = resolve_track_urls(sess, slug, track)
+        fetched_song_pages += fetched
+        if any(u.lower().endswith('.mp3') for u in urls):
+            mp3_tracks += 1
+        for url in urls:
+            key = url.lower()
+            if key not in seen:
+                seen.add(key)
+                queue.append(url)
+    if not queue:
+        raise RuntimeError('no direct urls')
+    return queue, {
+        'schema_version': SCHEMA_VERSION,
+        'album': slug,
+        'status': 'ok',
+        'tracks': len(tracks),
+        'queued_urls': len(queue),
+        'mp3_tracks': mp3_tracks,
+        'fetched_song_pages': fetched_song_pages,
+        'used_metadata': used_metadata,
+    }
+
+
+def main():
+    deadline = time.time() + MAX_SECONDS if MAX_SECONDS > 0 else None
+    done = load_done_from_output(OUT_FILE)
+    if os.path.exists(DONE_FILE):
+        done |= set(open(DONE_FILE).read().split()) & done
+    idx = json.load(open('index.json'))
+    slugs = []
+    for v in idx['entries'].values():
+        s = v.rsplit('/', 1)[-1]
+        if s not in done:
+            slugs.append(s)
+    metadata = load_metadata(METADATA_FILE)
+    print(f'todo: {len(slugs)} (already done: {len(done)})', flush=True)
+
+    out = open(OUT_FILE, 'a', buffering=1)
+    que = open(QUEUE_FILE, 'a', buffering=1)
+    dn = open(DONE_FILE, 'a', buffering=1)
+    fl = open(FAIL_FILE, 'a', buffering=1)
+
+    sess = cr.Session(impersonate='chrome')
+    try:
+        for i, slug in enumerate(slugs, 1):
+            if deadline and time.time() > deadline:
+                print('DIRECT time box reached', flush=True)
+                break
+            time.sleep(0.4 + random.random() * 0.6)
+            try:
+                queue, summary = process_album(sess, slug, metadata.get(slug))
+                for url in queue:
+                    que.write(url + '\n')
+                out.write(json.dumps(summary, ensure_ascii=False) + '\n')
+                dn.write(slug + '\n')
+            except Exception as exc:
+                fl.write(f'{slug}\t{type(exc).__name__}: {exc}\n')
+            if i % 50 == 0:
+                print(f'[{i}/{len(slugs)}] {slug}', flush=True)
+    finally:
+        out.close()
+        que.close()
+        dn.close()
+        fl.close()
+    print('DIRECT EXIT', flush=True)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,80 @@
+[
+  [
+    {
+      "slug": "30000-miles-of-changan-original-soundtrack-collection-2024",
+      "title": "\"30,000 Miles of Chang'an\" Original Soundtrack Collection",
+      "platforms": [],
+      "album_type": "Soundtrack",
+      "year": 2024
+    },
+    {
+      "slug": "a-school-surrounded-by-the-sea-seriously-ihatethiskindofsurvivallife-hearmeouttotheend-2021",
+      "title": "\"A school surrounded by the sea? Seriously? #IHateThisKindOfSurvivalLife #HearMeOutToTheEnd\"",
+      "platforms": [
+        "PS4",
+        "PS5",
+        "Steam",
+        "Switch"
+      ],
+      "album_type": "Soundtrack",
+      "year": 2021
+    },
+    {
+      "slug": "activity-case-01-graveyard-memory-2012",
+      "title": "\"Activity\" Case:01 -Graveyard Memory-",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Arrangement",
+      "year": 2012
+    },
+    {
+      "slug": "activity-case-02-nightmare-counselor-2013",
+      "title": "\"Activity\" Case:02 -Nightmare Counselor-",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Arrangement",
+      "year": 2013
+    },
+    {
+      "slug": "activity-case-03-historical-vacation-2013",
+      "title": "\"Activity\" Case:03 -Historical Vacation-",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Arrangement",
+      "year": 2013
+    },
+    {
+      "slug": "activity-case-04-cosmic-horoscope-2014",
+      "title": "\"Activity\" Case:04 -Cosmic Horoscope-",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Arrangement",
+      "year": 2014
+    },
+    {
+      "slug": "koihime†musou-haou-project-hao-pro-unit-no-jin-domgumi-2008",
+      "title": "\"Koihime†Musou\" Haou Project ~Hao Pro~ Unit no Jin Do-M-gumi",
+      "platforms": [
+        "Windows"
+      ],
+      "album_type": "Single",
+      "year": 2008
+    },
+    {
+      "slug": "101-games-multicart-200x",
+      "title": "101 Games (Multicart)",
+      "platforms": [
+        "Family Computer",
+        "NES"
+      ],
+      "album_type": "Compilation",
+      "year": null
+    }
+  ],
+  210,
+  104616
+]

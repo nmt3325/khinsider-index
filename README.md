@@ -57,7 +57,8 @@ One line per album in `album-meta.ndjson`:
 Then merge it with `index.json` into the `library.json` the relay consumes:
 
 ```sh
-python3 scripts/build_library.py --gzip
+python3 scripts/build_library.py --recent recent-albums.ndjson --gzip
+python3 scripts/publication.py library-changed --current library.json --previous previous-library.json
 ```
 
 ```json
@@ -93,5 +94,10 @@ Notes:
 - `scripts/scrape.py` (the old per-album scraper) is superseded by this: it uses
   plain `requests`, which Cloudflare blocks, and it has a syntax error in its
   track URL f-string. `albums/*.json` from it is left in place for reference.
-- `.github/workflows/album-meta.yaml` runs the crawl as a sharded manual job and
-  uploads `library.json`/`library.json.gz` as artifacts.
+- `.github/workflows/album-meta.yaml` now runs recent discovery every day, bootstraps or
+  reconciles the full listing/facet baseline when needed, refreshes album metadata for the
+  queued recent slugs, and only creates a library release when the album content actually changed.
+- `.github/workflows/album-meta-residual.yaml` keeps the long-running full album-page backfill
+  resumable while reusing the same crawl-data checkpoint assets.
+- `.github/workflows/song-index.yaml` restores canonical album metadata and skips uploads when the
+  published song manifest already matches the rebuilt content.

@@ -33,7 +33,8 @@ on the facet index at all.
 | `crawl_album_meta.py` | resumable individual-page crawler; the full workflow uses `--index library.json` |
 | `metadata_progress.py` | counts fetched, permanently unavailable and pending pages across the whole current library |
 | `residual_slugs.py` | optional manual field-specific selection; no longer used to restrict the full backfill |
-| `build_library.py` | merges all sources into `library.json` with a coverage manifest |
+| `build_library.py` | merges all sources into `library.json` with a coverage manifest; `--recent` overlays newly discovered albums before enrichment |
+| `publication.py` | compares library/song-index content identities so workflows can skip unchanged releases |
 | `release_notes.py` | converts the manifest into release notes / a job summary |
 
 ### Known, empty, unknown
@@ -49,9 +50,12 @@ an empty publisher/developer result from the page.
 
 ## Workflows
 
-`album-meta.yaml` runs the daily listing and facet sweeps. It merges the
-collected page records and publishes a dated library release after coverage
-gates pass. The newest seven library releases are retained.
+`album-meta.yaml` now runs recent discovery every day, restores the latest
+listing/facet/recent checkpoints, refreshes album metadata for the queued
+recent slugs, and performs a full listing/facet reconciliation weekly (or on
+manual request / bootstrap). It publishes only when the album content changed,
+not merely because generation timestamps or diagnostics did. The newest seven
+library releases are retained.
 
 `album-meta-residual.yaml` now runs **Album metadata full backfill**:
 
@@ -68,7 +72,8 @@ gates pass. The newest seven library releases are retained.
 - Treats 404/no-album-content results as unavailable, not fetched. Transient
   failures stay pending for later retries.
 - Publishes an updated `library.json` after batches add unpublished records,
-  using the same listing/publisher coverage gates as the daily sweep.
+  using the same listing/publisher coverage gates as the daily sweep and the
+  same content-hash guard as the daily publisher.
 - Writes `metadata-progress.json` to `crawl-data`, separating full-page
   coverage from the fraction of albums with any basic metadata.
 
@@ -99,3 +104,26 @@ python scripts/metadata_progress.py --summary metadata-progress.json
 Every crawler is resumable. Re-running skips completed work; `--refresh`
 forces per-page re-fetches, and `--deadline-minutes` stops cleanly before a
 runner timeout. Restore the persisted checkpoint before starting a new runner.
+
+`build_library.py` drops canonical `tracks` arrays when it reads `album-meta.ndjson`, so the
+library keeps the existing album-focused API even after the track-aware metadata crawl lands.
+
+
+## Offline regression tests and bounded full sweeps
+
+```sh
+python -m pip install -r scripts/requirements-meta.txt pytest ruff pyyaml
+PYTHONPATH=scripts:wayback python -m pytest -q scripts wayback test_shared_player.py
+ruff check --select E9,F63,F7,F82 scripts wayback test_shared_player.py
+```
+
+Run these from the repository root. Fixtures are committed in the repository;
+these tests do not crawl KHInsider, fetch audio, or submit archive requests.
+
+The manual daily-workflow entry retains `list_pages`, `publisher_limit`, and
+`developer_limit` (`0` means unlimited). Manual runs default to
+`full_reconcile=true`; explicitly set it to false for an incremental-only
+run when a complete baseline already exists and no staging remains.
+Scheduled full reconciliation is weekly (Monday UTC), with daily resumption
+of unfinished staging. Bounded or failed full runs keep the live baseline
+and checkpoint their unfinished work instead of publishing a partial catalog.

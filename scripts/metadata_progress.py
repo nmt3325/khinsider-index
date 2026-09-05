@@ -2,15 +2,16 @@
 """Measure individual-page coverage, independently of which fields are populated.
 
 A publisher/year obtained from a listing is NOT evidence of an album-page
-visit. Only a record in album-meta.ndjson counts as fetched. Permanent 404 /
-no-content results are reported separately; transient failures stay pending.
+visit. Only a record in album-meta.ndjson counts as fetched. Confirmed HTTP 404
+results are reported separately; malformed/no-content pages stay pending.
 Slug comparisons deliberately match crawl_album_meta.py's resume semantics.
 """
 import argparse
 import json
 from pathlib import Path
 
-PERMANENT_NOTES = {'gone', 'no album content'}
+# Legacy HTTP-200 parse failures must re-enter the retry queue.
+PERMANENT_NOTES = {'gone'}
 
 
 def metadata_slugs(path):
@@ -94,7 +95,7 @@ def main():
             for key in ('total', 'fetched', 'unavailable', 'pending', 'fetched_percent'):
                 stream.write(f'- {key}: **{result[key]}**\n')
             stream.write('\nFetched means an individual page was parsed; legitimate empty fields remain empty. '
-                         'Unavailable means 404 or no album content, not a successful fetch. '
+                         'Unavailable means a confirmed 404, not a successful fetch. '
                          'Transient failures remain pending for retry.\n')
     return 0
 

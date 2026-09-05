@@ -40,7 +40,12 @@ class MetadataProgressTests(unittest.TestCase):
         self.prepare([{'slug': s} for s in ('a', 'b', 'c', 'd')], failures=
                      'a\tgone\tA\nb\tno album content\tB\nc\tcloudflare\tC\nd\t500\tD\n')
         result = self.read()
-        self.assertEqual((result['unavailable'], result['pending']), (2, 2))
+        self.assertEqual((result['unavailable'], result['pending']), (1, 3))
+
+    def test_legacy_no_content_is_retryable(self):
+        self.prepare([{'slug': 'a'}], failures='a\tno album content\tA\n')
+        result = self.read()
+        self.assertEqual((result['unavailable'], result['pending']), (0, 1))
 
     def test_success_wins_over_old_failure(self):
         self.prepare([{'slug': 'a'}], [{'slug': 'a'}], 'a\tgone\tA\n')
