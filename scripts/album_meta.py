@@ -27,6 +27,8 @@ import urllib.parse
 
 from bs4.element import Comment, Tag
 
+from khinsider_player import extract_player_urls
+
 AUDIO_EXT_RE = re.compile(r'\.(mp3|flac|ogg|m4a|opus|wma|wav)$', re.I)
 SIZE_RE = re.compile(r'^\s*([\d.]+)\s*(B|KB|MB|GB)\s*$', re.I)
 DURATION_RE = re.compile(r'^\s*(\d{1,3}):([0-5]\d)(?::([0-5]\d))?\s*$')
@@ -47,6 +49,10 @@ INFO_LABELS = {
     'total filesize': 'total_filesize',
     'uploaded by': 'uploaders',
 }
+
+
+class SonglistError(ValueError):
+    """The album page looked real, but its songlist was missing or malformed."""
 
 
 def dedupe(seq):
@@ -101,6 +107,15 @@ def derive_letter(title):
     """khinsider browse section for an album title ('0-9' or 'A'-'Z')."""
     ch = (title or '').strip()[:1].upper()
     return ch if 'A' <= ch <= 'Z' else '0-9'
+
+
+def song_page_path(slug, basename):
+    return '/game-soundtracks/album/%s/%s' % (
+        urllib.parse.quote(slug), urllib.parse.quote(str(basename or ''), safe=''))
+
+
+def song_page_url(slug, basename, base='https://downloads.khinsider.com'):
+    return base.rstrip('/') + song_page_path(slug, basename)
 
 
 def _tags(nodes, name):
@@ -195,6 +210,8 @@ def _songlist_roles(table):
     shift = 0
     for i, label in enumerate(cells):
         idx = i + shift
+        if label in ('', '\xa0'):
+            continue
         if label == '#':
             roles[idx] = 'num'
         elif label == 'cd':
@@ -208,13 +225,33 @@ def _songlist_roles(table):
     return roles
 
 
-def parse_songlist(soup, slug):
-    """Return track dicts parsed from table#songlist."""
+def _row_basename(tr, slug):
+    prefix = '/game-soundtracks/album/%s/' % slug
+    for a in tr.find_all('a', href=True):
+        path = urllib.parse.urlparse(a['href']).path
+        if prefix in path and AUDIO_EXT_RE.search(path):
+            return urllib.parse.unquote(path.rsplit('/', 1)[-1])
+    return None
+
+
+def _fallback_title(basename):
+    stem = os.path.splitext(str(basename or ''))[0]
+    return urllib.parse.unquote(stem).strip() or None
+
+
+def parse_songlist(soup, slug, player_urls=None):
+    """Return validated track dicts parsed from table#songlist.
+
+    When the album player can be decoded statically, matching MP3 URLs are
+    joined by same-row ``songid`` and stored on each track.
+    """
     table = soup.select_one('table#songlist')
     if table is None:
-        return []
+        raise SonglistError('missing songlist')
     roles = _songlist_roles(table)
-    prefix = '/game-soundtracks/album/%s/' % slug
+    if 'title' not in roles.values():
+        raise SonglistError('unrecognized songlist header')
+    player_urls = player_urls or {}
     tracks = []
     for tr in table.find_all('tr'):
         if tr.get('id') in ('songlist_header', 'songlist_footer'):
@@ -222,16 +259,16 @@ def parse_songlist(soup, slug):
         cells = tr.find_all('td')
         if not cells:
             continue
-        basename = None
-        for a in tr.find_all('a', href=True):
-            path = urllib.parse.urlparse(a['href']).path
-            if prefix in path and AUDIO_EXT_RE.search(path):
-                basename = urllib.parse.unquote(path.rsplit('/', 1)[-1])
-                break
+        basename = _row_basename(tr, slug)
         if not basename:
             continue
         t = {'basename': basename, 'num': None, 'disc': None, 'title': None,
-             'duration': None, 'sizes': {}}
+             'duration': None, 'sizes': {}, 'songid': None}
+        songid_node = tr.select_one('.playlistAddTo[songid]')
+        if songid_node is not None:
+            songid = str(songid_node.get('songid') or '').strip()
+            if songid:
+                t['songid'] = songid
         for idx, cell in enumerate(cells):
             role = roles.get(idx)
             text = cell.get_text(' ', strip=True)
@@ -250,21 +287,32 @@ def parse_songlist(soup, slug):
                 if size:
                     t['sizes'][role[5:]] = size
         if not t['title']:
-            t['title'] = os.path.splitext(basename)[0]
+            t['title'] = _fallback_title(basename)
         t['num'] = t['num'] or len(tracks) + 1
         t['formats'] = [f for f in AUDIO_FORMATS if f in t['sizes']] or ['mp3']
+        if t.get('songid') and t['songid'] in player_urls:
+            t['mp3_url'] = player_urls[t['songid']]
         tracks.append(t)
+    if not tracks:
+        raise SonglistError('empty songlist')
+    if player_urls:
+        row_songids = [t.get('songid') for t in tracks]
+        if any(not s for s in row_songids):
+            raise SonglistError('songlist rows missing songid')
+        if set(player_urls) != set(row_songids):
+            raise SonglistError('songid/player mismatch')
     return tracks
 
 
-def album_record(slug, soup):
-    """Album page -> one flat metadata record for the index."""
+def album_record(slug, soup, html=None):
+    """Album page -> one metadata record with a validated complete track list."""
     h2 = soup.select_one('#pageContent h2')
     title = h2.get_text(' ', strip=True) if h2 else None
     if not title or title.lower().startswith('ooops'):
         return None
     info = parse_album_info(soup)
-    tracks = parse_songlist(soup, slug)
+    player_urls = extract_player_urls(html or str(soup), slug)
+    tracks = parse_songlist(soup, slug, player_urls=player_urls)
     covers = dedupe([a['href'] for a in soup.select('div.albumImage a[href]')])
     formats = dedupe([f for t in tracks for f in t['formats']])
     durations = [t['duration'] for t in tracks if t.get('duration')]
@@ -285,5 +333,7 @@ def album_record(slug, soup):
         'duration': sum(durations) if durations else None,
         'formats': formats,
         'cover': covers[0] if covers else None,
+        'tracks_complete': True,
+        'tracks': tracks,
     }
     return rec

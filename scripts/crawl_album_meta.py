@@ -1,37 +1,12 @@
 #!/usr/bin/env python3
-"""Crawl per-album metadata from khinsider album pages.
-
-index.json only knows title -> album path, so it has no release year,
-publisher, platform or album type. This script visits every album page once
-and writes one JSON object per album to a resumable NDJSON file:
-
-    {"slug": "nintendo-3ds-background-music", "title": "3DS Background Music",
-     "letter": "0-9", "year": 2011, "publishers": ["Nintendo"],
-     "developers": [], "platforms": ["3DS"], "album_type": "Gamerip",
-     "date_added": "2026-04-07", "track_count": 106, "duration": 9786, ...}
-
-build_library.py then merges index.json + this file into the library.json
-consumed by khinsider-subsonic-relay, which maps the fields onto Subsonic
-tags (year -> release date, publisher -> album artist, platform and album
-type -> genres).
-
-Examples:
-    python crawl_album_meta.py --limit 200            # smoke test
-    python crawl_album_meta.py --letters A,B,C        # one browse section
-    python crawl_album_meta.py --shard 1/8            # 8 parallel jobs
-    python crawl_album_meta.py                        # everything (resumable)
-
-Re-running always resumes: albums already present in the NDJSON are skipped
-unless --refresh is passed. Cloudflare challenges are retried with backoff;
-permanent failures are appended to the failure log and can be retried later
-with --retry-failures.
-"""
+"""Crawl per-album metadata from khinsider album pages."""
 import argparse
+import calendar
+import collections
 import hashlib
 import json
 import os
 import random
-import sys
 import threading
 import time
 import urllib.parse
@@ -45,6 +20,8 @@ BASE = 'https://downloads.khinsider.com'
 ALBUM_PREFIX = '/game-soundtracks/album/'
 CF_MARKERS = ('attention required', 'just a moment', 'cf-browser-verification',
               'enable javascript and cookies to continue')
+PERMANENT_NOTES = ('gone', 'no album content')
+TIME_FMT = '%Y-%m-%dT%H:%M:%SZ'
 _local = threading.local()
 _lock = threading.Lock()
 
@@ -66,8 +43,8 @@ def load_slugs(path):
             if slug:
                 out.append((slug, title))
     elif isinstance(data, dict) and 'albums' in data:
-        for album in data['albums']:
-            out.append((album['slug'], album.get('title') or album['slug']))
+        for item in data['albums']:
+            out.append((item['slug'], item.get('title') or item['slug']))
     elif isinstance(data, list):
         for item in data:
             if isinstance(item, str):
@@ -79,8 +56,28 @@ def load_slugs(path):
     return out
 
 
+def dedupe_targets(rows):
+    seen = set()
+    out = []
+    for slug, title in rows:
+        if slug and slug not in seen:
+            seen.add(slug)
+            out.append((slug, title))
+    return out
+
+
+def _parse_crawled_at(text):
+    if not text:
+        return None
+    try:
+        return int(calendar.timegm(time.strptime(text, TIME_FMT)))
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
 def load_done(path):
-    done = set()
+    """Latest successful crawl timestamp per slug from the NDJSON output."""
+    done = {}
     if not os.path.exists(path):
         return done
     with open(path, encoding='utf-8') as f:
@@ -89,23 +86,21 @@ def load_done(path):
             if not line:
                 continue
             try:
-                done.add(json.loads(line)['slug'])
+                rec = json.loads(line)
             except Exception:
                 continue
+            slug = rec.get('slug')
+            if not slug:
+                continue
+            cur = _parse_crawled_at(rec.get('crawled_at')) or 0
+            prev = done.get(slug, 0)
+            if cur >= prev:
+                done[slug] = cur
     return done
 
 
-PERMANENT_NOTES = ('gone', 'no album content')
-
-
 def load_failed(path, permanent_only=True):
-    """Slugs from the failure log.
-
-    Only permanent failures are worth skipping forever: a 404, or a page with
-    no album content. Cloudflare challenges, timeouts and 5xx are transient,
-    so by default they stay in the queue and get retried on the next run -
-    otherwise one bad afternoon would blacklist those albums permanently.
-    """
+    """Slugs from the failure log."""
     failed = set()
     if not os.path.exists(path):
         return failed
@@ -122,8 +117,36 @@ def load_failed(path, permanent_only=True):
     return failed
 
 
+def should_refresh(last_done, refresh_days, now=None):
+    if not refresh_days:
+        return False
+    if not last_done:
+        return True
+    now = now or time.time()
+    return last_done <= now - refresh_days * 86400
+
+
+def filter_targets(targets, done, failures_path, refresh=False,
+                   refresh_days=0, retry_failures=False, now=None):
+    skip = set()
+    if not retry_failures:
+        skip |= load_failed(failures_path, permanent_only=True)
+    todo = []
+    for slug, title in targets:
+        if slug in skip:
+            continue
+        if refresh:
+            todo.append((slug, title))
+            continue
+        last_done = done.get(slug)
+        if last_done and not should_refresh(last_done, refresh_days, now=now):
+            continue
+        todo.append((slug, title))
+    return todo
+
+
 def fetch(slug, retries, delay, jitter):
-    """Fetch an album page. Returns (soup, status) with soup=None on failure."""
+    """Fetch an album page. Returns (html, status) with html=None on failure."""
     url = BASE + ALBUM_PREFIX + urllib.parse.quote(slug)
     for attempt in range(retries):
         time.sleep(delay + random.random() * jitter)
@@ -140,14 +163,14 @@ def fetch(slug, retries, delay, jitter):
                 if any(m in low for m in CF_MARKERS):
                     status = 'cloudflare'
                 else:
-                    return BeautifulSoup(r.text, 'html.parser'), 200
+                    return r.text, 200
         backoff = min(60, (2 ** attempt) * 2) + random.random() * 3
         if attempt < retries - 1:
             time.sleep(backoff)
     return None, status
 
 
-def main():
+def main(argv=None):
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -169,9 +192,11 @@ def main():
     ap.add_argument('--deadline-minutes', type=float, default=0.0,
                     help='stop cleanly after N minutes (0 = no deadline)')
     ap.add_argument('--refresh', action='store_true', help='re-crawl albums already in --out')
+    ap.add_argument('--refresh-days', type=float, default=0.0,
+                    help='re-crawl records older than N days (0 = disabled)')
     ap.add_argument('--retry-failures', action='store_true', help='also retry slugs in the failure log')
     ap.add_argument('--progress-every', type=int, default=50)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.slug or args.slugs_file:
         targets = [(s, s) for s in args.slug]
@@ -190,16 +215,13 @@ def main():
             i, n = (int(x) for x in args.shard.split('/'))
             targets = [row for k, row in enumerate(targets) if k % n == (i - 1) % n]
 
+    targets = dedupe_targets(targets)
     if args.order == 'hash':
-        # deterministic shuffle: successive capped runs sample the whole
-        # archive evenly instead of grinding through the same prefix
-        targets.sort(key=lambda row: hashlib.md5(row[0].encode('utf-8')).hexdigest())
+        targets = sorted(targets, key=lambda row: hashlib.md5(row[0].encode('utf-8')).hexdigest())
 
-    done = set() if args.refresh else load_done(args.out)
-    skip = set(done)
-    if not args.retry_failures:
-        skip |= load_failed(args.failures, permanent_only=True)
-    todo = [(s, t) for s, t in targets if s not in skip]
+    done = {} if args.refresh else load_done(args.out)
+    todo = filter_targets(targets, done, args.failures, refresh=args.refresh,
+                          refresh_days=args.refresh_days, retry_failures=args.retry_failures)
     if args.limit:
         todo = todo[:args.limit]
     print('%d albums total, %d already done, %d to crawl (workers=%d)'
@@ -211,26 +233,36 @@ def main():
     failures = open(args.failures, 'a', encoding='utf-8')
     state = {'ok': 0, 'gone': 0, 'fail': 0, 'n': 0}
     started = time.time()
+    stop = threading.Event()
+    qlock = threading.Lock()
+    queue = collections.deque(todo)
+    deadline = started + args.deadline_minutes * 60 if args.deadline_minutes else 0
 
     def worker(item):
         slug, title = item
-        soup, status = fetch(slug, args.retries, args.delay, args.jitter)
+        html, status = fetch(slug, args.retries, args.delay, args.jitter)
         record, note = None, None
-        if soup is not None:
-            record = album_meta.album_record(slug, soup)
-            if record is None:
-                note = 'no album content'
+        if html is not None:
+            soup = BeautifulSoup(html, 'html.parser')
+            try:
+                record = album_meta.album_record(slug, soup, html=html)
+                if record is None:
+                    note = 'no album content'
+            except album_meta.SonglistError as exc:
+                note = 'songlist parse error: %s' % exc
+            except Exception as exc:
+                note = 'parse exception: %s' % exc
         else:
             note = str(status)
         with _lock:
             state['n'] += 1
             if record is not None:
-                record['crawled_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+                record['crawled_at'] = time.strftime(TIME_FMT, time.gmtime())
                 out.write(json.dumps(record, ensure_ascii=False) + '\n')
                 out.flush()
                 state['ok'] += 1
             else:
-                if note in ('gone', 'no album content'):
+                if note in PERMANENT_NOTES:
                     state['gone'] += 1
                 else:
                     state['fail'] += 1
@@ -244,22 +276,18 @@ def main():
                       % (state['n'], len(todo), state['ok'], state['gone'],
                          state['fail'], rate, left / 60), flush=True)
 
-    threads = []
-    queue = list(todo)
-    qlock = threading.Lock()
-
-    deadline = started + args.deadline_minutes * 60 if args.deadline_minutes else 0
-
     def run():
-        while True:
+        while not stop.is_set():
             if deadline and time.time() >= deadline:
+                stop.set()
                 return
             with qlock:
                 if not queue:
                     return
-                item = queue.pop()
+                item = queue.popleft()
             worker(item)
 
+    threads = []
     for _ in range(max(1, args.workers)):
         th = threading.Thread(target=run, daemon=True)
         th.start()
@@ -269,15 +297,19 @@ def main():
             while th.is_alive():
                 th.join(timeout=1)
     except KeyboardInterrupt:
+        stop.set()
         with qlock:
             queue.clear()
-        print('interrupted; rerun to resume', flush=True)
-    out.close()
-    failures.close()
+        print('interrupted; waiting for in-flight workers to finish', flush=True)
+    finally:
+        for th in threads:
+            th.join()
+        out.close()
+        failures.close()
     if deadline and time.time() >= deadline:
         print('deadline reached; rerun to resume', flush=True)
     print('done: ok=%d gone=%d fail=%d in %.1fmin'
-          % (state['ok'], state['gone'], state['fail'], (time.time() - started) / 60))
+          % (state['ok'], state['gone'], state['fail'], (time.time() - started) / 60), flush=True)
 
 
 if __name__ == '__main__':

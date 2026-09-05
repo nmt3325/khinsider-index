@@ -1,9 +1,8 @@
 name: song-index
 
 # Builds the song title index (songs.tsv.gz) that the Subsonic relay uses for
-# song-name search, from the crawled track URLs stored on the song-urls
-# release.  Published to its own PRE-release tag on purpose: "latest" must keep
-# pointing at the library.json release that the relay downloads by default.
+# song-name search. Published to its own pre-release tag on purpose: "latest"
+# must keep pointing at the library.json release that the relay downloads by default.
 
 on:
   workflow_dispatch:
@@ -15,7 +14,6 @@ on:
         description: Release holding the crawl assets
         default: song-urls-2026-09-01
   schedule:
-    # Mondays, a few hours after the wayback crawl has had a full weekend
     - cron: '17 5 * * 1'
 
 concurrency:
@@ -36,8 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: scripts
-          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts
+          sparse-checkout-cone-mode: true
 
       - uses: actions/setup-python@v5
         with:
@@ -50,6 +49,9 @@ jobs:
             --pattern crawl_state_snapshot.tar.gz \
             --pattern songs_cached.jsonl.gz \
             --dir work --clobber
+          gh release download crawl-data --repo "$GITHUB_REPOSITORY" \
+            --pattern 'album-meta.ndjson*' \
+            --dir work --clobber
           ls -la work
 
       - name: Download library.json for coverage stats
@@ -60,18 +62,48 @@ jobs:
             echo "no library.json on the latest release, skipping coverage stats"
           fi
 
+      - name: Download the previous song manifest
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern songs-index.json --dir work --clobber || true
+            if [ -f work/songs-index.json ]; then
+              mv work/songs-index.json work/previous-songs-index.json
+            fi
+          fi
+
       - name: Build song index
         run: |
+          metadata=work/album-meta.ndjson.gz
+          if [ ! -f "$metadata" ]; then
+            metadata=work/album-meta.ndjson
+          fi
+          test -f "$metadata"
+          coverage_args=()
+          if [ -f work/library.json ]; then
+            coverage_args+=(--library work/library.json)
+          fi
           python scripts/build_song_index.py \
             --snapshot work/crawl_state_snapshot.tar.gz \
             --cached work/songs_cached.jsonl.gz \
-            --library work/library.json \
+            --metadata "$metadata" \
+            "${coverage_args[@]}" \
             --out work/songs.tsv.gz \
             --manifest work/songs-index.json
           ls -la work/songs.tsv.gz work/songs-index.json
           cat work/songs-index.json
 
+      - name: Compare with the published manifest
+        id: compare
+        run: |
+          args=(song-manifest-changed --current work/songs-index.json --github-output "$GITHUB_OUTPUT")
+          if [ -f work/previous-songs-index.json ]; then
+            args+=(--previous work/previous-songs-index.json)
+          fi
+          python scripts/publication.py "${args[@]}"
+
       - name: Publish
+        if: steps.compare.outputs.changed == 'true'
         run: |
           if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
@@ -81,3 +113,7 @@ jobs:
           gh release upload "$TAG" work/songs.tsv.gz work/songs-index.json \
             --repo "$GITHUB_REPOSITORY" --clobber
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY"
+
+      - name: Skip upload when the manifest is unchanged
+        if: steps.compare.outputs.changed != 'true'
+        run: echo "song manifest unchanged; skipped upload" >> "$GITHUB_STEP_SUMMARY"

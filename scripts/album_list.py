@@ -29,8 +29,8 @@ import threading
 import time
 import urllib.parse
 
-from bs4 import BeautifulSoup
 from curl_cffi import requests as creq
+from lxml import html as lxml_html
 
 BASE = 'https://downloads.khinsider.com'
 ALBUM_PREFIX = '/game-soundtracks/album/'
@@ -49,7 +49,7 @@ CF_MARKERS = ('attention required', 'just a moment', 'cf-browser-verification',
               'enable javascript and cookies to continue')
 
 # notes that mean "never ask again" rather than "try again later"
-PERMANENT_NOTES = ('gone', 'no-list-table')
+PERMANENT_NOTES = ('gone',)
 
 _local = threading.local()
 
@@ -124,11 +124,42 @@ def norm_slug(slug):
         return slug
 
 
+def _doc(text):
+    if hasattr(text, 'xpath'):
+        return text
+    return lxml_html.fromstring(text)
+
+
+def _classes(node):
+    return set((node.get('class') or '').split())
+
+
+def _text(node, sep=' '):
+    parts = [part.strip() for part in node.xpath('.//text()') if part.strip()]
+    return sep.join(parts)
+
+
+def _table_nodes(doc):
+    return doc.xpath('//table[contains(concat(" ", normalize-space(@class), " "), " albumList ")]')
+
+
+def _table_rows(table):
+    return table.xpath('./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr')
+
+
+def has_album_table(text):
+    """True when the page contains an albumList table, even if it has 0 rows."""
+    return bool(_table_nodes(_doc(text)))
+
+
 def _link_list(td):
-    values = [a.get_text(strip=True) for a in td.find_all('a')]
-    values = [v for v in values if v]
+    values = []
+    for a in td.xpath('.//a'):
+        value = _text(a)
+        if value:
+            values.append(value)
     if not values:
-        text = td.get_text(' ', strip=True)
+        text = _text(td)
         values = [part.strip() for part in text.split(',') if part.strip()]
     out, seen = [], set()
     for value in values:
@@ -154,7 +185,7 @@ def _row_record(tds, header):
             cells[name] = td
     slug = None
     for td in tds:
-        for a in td.find_all('a'):
+        for a in td.xpath('.//a[@href]'):
             slug = slug_from_href(a.get('href'))
             if slug:
                 break
@@ -165,22 +196,21 @@ def _row_record(tds, header):
     album_td = cells.get('album')
     record = {
         'slug': slug,
-        'title': album_td.get_text(strip=True) if album_td is not None else '',
+        'title': _text(album_td, '') if album_td is not None else '',
     }
     if 'platform' in cells:
         record['platforms'] = _link_list(cells['platform'])
     if 'type' in cells:
-        record['album_type'] = cells['type'].get_text(strip=True) or None
+        record['album_type'] = _text(cells['type']) or None
     if 'year' in cells:
-        record['year'] = _to_year(cells['year'].get_text(strip=True))
+        record['year'] = _to_year(_text(cells['year']))
     return record
 
 
-def page_count(soup):
+def page_count(doc):
     """Highest ?page=N linked from the pager (1 when there is no pager)."""
     best = 1
-    for a in soup.find_all('a'):
-        href = a.get('href') or ''
+    for href in doc.xpath('//a[@href]/@href'):
         if 'page=' not in href:
             continue
         value = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get('page')
@@ -189,19 +219,22 @@ def page_count(soup):
     return best
 
 
-def total_count(soup):
+def total_count(doc):
     """The 'Found 5765 albums!' headline, when the page has one."""
-    for tag in soup.find_all(['h2', 'p', 'div', 'span']):
-        text = tag.get_text(' ', strip=True)
-        if not text.startswith('Found ') or 'album' not in text:
+    for tag in doc.xpath('//h2|//p|//div|//span'):
+        text = _text(tag)
+        if not text.startswith('Found '):
             continue
-        token = text.split()[1].replace(',', '') if len(text.split()) > 1 else ''
+        if 'album' not in text.lower():
+            continue
+        parts = text.split()
+        token = parts[1].replace(',', '') if len(parts) > 1 else ''
         if token.isdigit():
             return int(token)
     return None
 
 
-def parse_album_list(html):
+def parse_album_list(text):
     """html -> (rows, pages, total).
 
     rows is a list of {slug, title, platforms, album_type, year} dicts, with
@@ -209,18 +242,19 @@ def parse_album_list(html):
     A missing table (a facet with no albums, or an error page) yields ([], 1,
     total) so callers can tell it apart from a fetch failure.
     """
-    soup = BeautifulSoup(html, 'lxml')
-    table = soup.select_one('table.albumList')
-    pages, total = page_count(soup), total_count(soup)
-    if table is None:
+    doc = _doc(text)
+    tables = _table_nodes(doc)
+    pages, total = page_count(doc), total_count(doc)
+    if not tables:
         return [], pages, total
+    table = tables[0]
     rows, header = [], []
-    for tr in table.find_all('tr'):
-        ths = tr.find_all('th')
+    for tr in _table_rows(table):
+        ths = tr.xpath('./th')
         if ths:
-            header = [th.get_text(strip=True).lower() for th in ths]
+            header = [_text(th).lower() for th in ths]
             continue
-        tds = tr.find_all('td')
+        tds = tr.xpath('./td')
         if not tds:
             continue
         record = _row_record(tds, header)
@@ -229,16 +263,16 @@ def parse_album_list(html):
     return rows, pages, total
 
 
-def parse_facet_index(html, kind):
+def parse_facet_index(text, kind):
     """/album-publishers or /album-developers -> [{key, name, count, href}].
 
     khinsider only lists entities with 11 or more albums here, so the counts
     also tell us up front how much of the archive a facet sweep can cover.
     """
     prefix = FACET_PREFIX[kind]
-    soup = BeautifulSoup(html, 'lxml')
+    doc = _doc(text)
     out, seen = [], set()
-    for a in soup.find_all('a'):
+    for a in doc.xpath('//a[@href]'):
         href = a.get('href') or ''
         path = urllib.parse.urlparse(href).path
         if prefix not in path:
@@ -248,16 +282,14 @@ def parse_facet_index(html, kind):
             continue
         seen.add(key)
         count = None
-        tail = a.next_sibling
-        if isinstance(tail, str):
-            token = tail.strip()
-            if token.startswith('(') and ')' in token:
-                digits = token[1:token.index(')')].replace(',', '')
-                if digits.isdigit():
-                    count = int(digits)
+        tail = a.tail.strip() if a.tail else ''
+        if tail.startswith('(') and ')' in tail:
+            digits = tail[1:tail.index(')')].replace(',', '')
+            if digits.isdigit():
+                count = int(digits)
         out.append({
             'key': key,
-            'name': a.get_text(strip=True),
+            'name': _text(a, ''),
             'count': count,
             'href': href,
         })
