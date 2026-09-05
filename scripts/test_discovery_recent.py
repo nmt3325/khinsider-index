@@ -6,6 +6,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import album_list
 import crawl_recent
+from live_test_helpers import record
 
 
 
@@ -51,7 +52,7 @@ def test_recent_discovers_multiple_dates_and_replacement(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, 'argv', ['crawl_recent.py', '--state', str(state), '--out', str(out), '--queue', str(queue), '--metadata', str(meta)])
     assert crawl_recent.main() == 0
     data = json.loads(state.read_text(encoding='utf-8'))
-    assert data['watermark'] == '2026-09-04'
+    assert data['watermark'] == '2026-09-05'
     assert len(data['pending']) == 3
     assert queue.read_text(encoding='utf-8').splitlines() == ['alpha', 'beta']
     rows = [json.loads(line) for line in out.read_text(encoding='utf-8').splitlines() if line.strip()]
@@ -113,7 +114,7 @@ def test_ack_requires_strictly_later_crawled_at(monkeypatch, tmp_path):
         },
     }), encoding='utf-8')
     out.write_text('', encoding='utf-8')
-    meta.write_text(json.dumps({'slug': 'alpha', 'crawled_at': '2026-09-05T12:00:10Z'}) + '\n', encoding='utf-8')
+    meta.write_text(json.dumps(record('alpha', when='2026-09-05T12:00:10Z')) + '\n', encoding='utf-8')
 
     monkeypatch.setattr(sys, 'argv', ['crawl_recent.py', '--ack-only', '--state', str(state), '--out', str(out), '--queue', str(queue), '--metadata', str(meta)])
     assert crawl_recent.main() == 0
@@ -121,7 +122,7 @@ def test_ack_requires_strictly_later_crawled_at(monkeypatch, tmp_path):
     assert len(data['pending']) == 1
     assert not data['seen']
 
-    meta.write_text(json.dumps({'slug': 'alpha', 'crawled_at': '2026-09-05T12:00:11Z'}) + '\n', encoding='utf-8')
+    meta.write_text(json.dumps(record('alpha', when='2026-09-05T12:00:11Z')) + '\n', encoding='utf-8')
     monkeypatch.setattr(sys, 'argv', ['crawl_recent.py', '--ack-only', '--state', str(state), '--out', str(out), '--queue', str(queue), '--metadata', str(meta)])
     assert crawl_recent.main() == 0
     data = json.loads(state.read_text(encoding='utf-8'))

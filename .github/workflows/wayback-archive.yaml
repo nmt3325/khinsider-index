@@ -5,10 +5,6 @@ on:
     - cron: "42 */6 * * *"
   workflow_dispatch:
     inputs:
-      crawl_minutes:
-        description: "Minutes to crawl album pages for song URLs (0 = skip)"
-        default: "20"
-        required: false
       direct_minutes:
         description: "Minutes to generate direct audio-file URLs (0 = skip)"
         default: "60"
@@ -27,7 +23,9 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: 1
-  METADATA_FILE: album-meta.ndjson
+  METADATA_FILE: work/live-v2/album-meta.ndjson
+  CATALOGUE_FILE: work/live-v2/catalogue.json
+  PYTHONPATH: scripts
 
 jobs:
   archive:
@@ -35,13 +33,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 355
     steps:
-      - name: Checkout (wayback, scripts, index)
+      - name: Checkout archival tools and standalone crawler
         uses: actions/checkout@v4
         with:
           sparse-checkout: |
             wayback
             scripts
-            index.json
           sparse-checkout-cone-mode: false
 
       - name: Set up Python
@@ -66,26 +63,40 @@ jobs:
             --dir /tmp/khrel --clobber
           tar xzf /tmp/khrel/crawl_state_snapshot.tar.gz
           gunzip -c /tmp/khrel/wayback_queue_khinsider-track-urls.txt.gz > work/wayback_queue.txt
-          gh release download crawl-data --pattern 'album-meta.ndjson*' --clobber
-          if [ -f album-meta.ndjson.gz ]; then gunzip -f album-meta.ndjson.gz; fi
-          test -s album-meta.ndjson
           touch work/wayback_done.txt work/wayback_failed.txt work/crawl_failures.log \
                 work/direct_done.txt work/direct_failures.log work/direct_queue.txt work/direct_links.jsonl
           wc -l work/*.txt | tail -10 || true
 
-      - name: Crawl album pages for song URLs (time-boxed)
+      - name: Restore modern metadata separately from archival history
+        id: modern
         env:
-          CRAWL_MINUTES: ${{ github.event.inputs.crawl_minutes || '20' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          export CRAWL_MAX_SECONDS=$(( ${CRAWL_MINUTES%.*} * 60 ))
-          echo "crawl budget: ${CRAWL_MAX_SECONDS}s"
-          python wayback/crawl_songs.py
+          set -euo pipefail
+          python scripts/live_pipeline.py restore --repo "$GITHUB_REPOSITORY"
+          python - <<'PY'
+          import os
+          import live_data
+          from pathlib import Path
+          catalogue = Path(os.environ['CATALOGUE_FILE'])
+          ready = False
+          if catalogue.exists():
+              ready = live_data.inspect(catalogue, os.environ['METADATA_FILE'])[-1]['complete']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write('ready=' + str(ready).lower() + '\n')
+          print('Modern metadata complete:', ready)
+          PY
 
       - name: Generate direct audio-file URLs (time-boxed)
+        if: ${{ steps.modern.outputs.ready == 'true' }}
         env:
           DIRECT_MINUTES: ${{ github.event.inputs.direct_minutes || '60' }}
         run: |
-          export DIRECT_MAX_SECONDS=$(( ${DIRECT_MINUTES%.*} * 60 ))
+          [[ "$DIRECT_MINUTES" =~ ^[0-9]{1,3}$ ]] || exit 1
+          DIRECT_MINUTES=$((10#$DIRECT_MINUTES))
+          (( DIRECT_MINUTES <= 60 )) || exit 1
+          if (( DIRECT_MINUTES == 0 )); then exit 0; fi
+          export DIRECT_MAX_SECONDS=$(( DIRECT_MINUTES * 60 ))
           echo "direct budget: ${DIRECT_MAX_SECONDS}s"
           python wayback/direct_links.py
 
@@ -96,6 +107,11 @@ jobs:
           SUBMIT_MINUTES: ${{ github.event.inputs.submit_minutes || '260' }}
           QUEUE_GLOB: work/queue_submit.txt
         run: |
+          [[ "$SUBMIT_MINUTES" =~ ^[0-9]{1,3}$ ]] || exit 1
+          SUBMIT_MINUTES=$((10#$SUBMIT_MINUTES))
+          (( SUBMIT_MINUTES <= 260 )) || exit 1
+          if (( SUBMIT_MINUTES == 0 )); then exit 0; fi
+          touch work/wayback_queue_crawled.txt
           cat work/wayback_queue_crawled.txt work/direct_queue.txt work/wayback_queue.txt > work/queue_submit.txt
           wc -l work/queue_submit.txt
           export SPN2_MAX_SECONDS=$(( ${SUBMIT_MINUTES%.*} * 60 ))

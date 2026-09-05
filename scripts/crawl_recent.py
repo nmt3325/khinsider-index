@@ -16,6 +16,7 @@ import time
 from lxml import html as lxml_html
 
 import album_list
+import live_data
 
 STATE_VERSION = 1
 
@@ -69,6 +70,7 @@ def load_state(path):
         'watermark': data.get('watermark'),
         'seen': data.get('seen') or {},
         'pending': data.get('pending') or {},
+        'cursor': data.get('cursor'),
     })
     return base
 
@@ -80,6 +82,7 @@ def save_state(path, state):
         'watermark': state.get('watermark'),
         'seen': state.get('seen', {}),
         'pending': state.get('pending', {}),
+        'cursor': state.get('cursor'),
     })
 
 
@@ -121,28 +124,8 @@ def save_recent_rows(path, rows):
 
 
 def load_meta_crawled(path):
-    out = {}
-    if not os.path.exists(path):
-        return out
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except Exception:
-                continue
-            slug = record.get('slug')
-            crawled_at = record.get('crawled_at')
-            if not slug or not crawled_at:
-                continue
-            key = album_list.norm_slug(slug)
-            prev = out.get(key)
-            if prev is None or crawled_at > prev:
-                out[key] = crawled_at
-    return out
-
+    return {album_list.norm_slug(slug): record['crawled_at']
+            for slug, record in live_data.latest_records(path).items()}
 
 
 def event_key(slug, listed_at):
@@ -296,15 +279,21 @@ def main():
         cutoff = subtract_days(state['watermark'], max(0, args.overlap_days))
 
     started = time.time()
-    page = 1
-    last_page = 1
-    oldest_processed = None
+    cursor = state.get('cursor') or {}
+    page = cursor.get('page', 1)
+    if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+        raise live_data.DataError('invalid recent-discovery cursor')
+    if cursor:
+        cutoff = cursor.get('cutoff')
+    initial_page = page
+    last_page = page
+    newest_processed = cursor.get('newest')
     complete = True
     stop_reason = None
     reached_cutoff = False
 
     while page <= last_page:
-        if args.max_pages and page > args.max_pages:
+        if args.max_pages and page - initial_page >= args.max_pages:
             complete = False
             stop_reason = 'max-pages'
             break
@@ -328,7 +317,7 @@ def main():
             if cutoff and listed_at < cutoff:
                 reached_cutoff = True
                 break
-            oldest_processed = listed_at
+            newest_processed = max(newest_processed or listed_at, listed_at)
             discovered_at = album_list.utc_now()
             for row in page_rows:
                 key = event_key(row['slug'], listed_at)
@@ -352,9 +341,12 @@ def main():
             break
         page += 1
 
-    if complete and oldest_processed:
-        state['watermark'] = oldest_processed
+    if complete and newest_processed:
+        state['watermark'] = max(state.get('watermark') or newest_processed, newest_processed)
 
+    state['cursor'] = None if complete else {
+        'page': page, 'cutoff': cutoff, 'newest': newest_processed,
+    }
     save_recent_rows(args.out, rows)
     save_state(args.state, state)
     save_queue(args.queue, state)

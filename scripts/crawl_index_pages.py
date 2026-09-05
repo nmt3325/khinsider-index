@@ -29,6 +29,7 @@ import sys
 import time
 
 import album_list
+import live_data
 
 
 STAGE_SUFFIX = '-staging'
@@ -133,6 +134,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--out', default=os.path.join(here, '..', 'album-list.ndjson'))
     ap.add_argument('--state', default=os.path.join(here, '..', 'album-list.pages'))
+    ap.add_argument('--catalogue', default='', help='certify a complete live-v2 catalogue')
     ap.add_argument('--failures', default=os.path.join(here, '..', 'album-list-failures.log'))
     ap.add_argument('--path', default=album_list.LIST_PATH,
                     help='listing path to sweep (default %s)' % album_list.LIST_PATH)
@@ -169,6 +171,7 @@ def main():
 
     fetch_kw = dict(retries=args.retries, delay=args.delay, jitter=args.jitter)
     started = time.time()
+    observed_start = album_list.utc_now()
 
     first_url = album_list.list_page_url(1, args.path)
     html, note = album_list.fetch(first_url, **fetch_kw)
@@ -249,6 +252,17 @@ def main():
     if args.fresh:
         if not complete:
             return 1
+        if args.catalogue:
+            if args.path != album_list.LIST_PATH:
+                raise SystemExit('only the full album listing can certify a catalogue')
+            try:
+                live_data.write_catalogue(out_path, args.catalogue, last_page, total, observed_start)
+            except live_data.IncompleteData as exc:
+                # A finished-but-incoherent page set cannot make progress by
+                # resuming its ledger. Keep one rejected sample, then rescan.
+                replace_file(out_path, args.out + '.rejected')
+                reset_paths((out_path, state_path, fail_path, marker_path))
+                raise SystemExit(str(exc)) from exc
         replace_file(out_path, args.out)
         replace_file(state_path, args.state)
         replace_file(fail_path, args.failures)

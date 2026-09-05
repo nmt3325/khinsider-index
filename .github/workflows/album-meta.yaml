@@ -1,255 +1,26 @@
-# Listing + facet sweep plus recent discovery for metadata publication.
 name: Album metadata sweep
 
 on:
   schedule:
-    - cron: "20 3 * * *"
+    - cron: '20 3 * * *'
   workflow_dispatch:
     inputs:
-      full_reconcile:
-        description: "Force a full listing + facet reconciliation"
-        type: boolean
-        default: true
-      list_pages:
-        description: 'Maximum new listing pages per full run (0 = unlimited)'
-        type: string
-        default: '0'
-      publisher_limit:
-        description: 'Maximum publishers per full run (0 = unlimited)'
-        type: string
-        default: '0'
-      developer_limit:
-        description: 'Maximum developers per full run (0 = unlimited)'
-        type: string
-        default: '0'
+      minutes:
+        description: 'Collection budget in minutes (1–240)'
+        type: number
+        default: 180
       publish:
-        description: "Publish a library.json release"
+        description: 'Publish only when all current albums have complete tracks'
         type: boolean
         default: true
-
-concurrency:
-  group: khinsider-metadata
-  cancel-in-progress: false
 
 permissions:
   contents: write
 
-defaults:
-  run:
-    shell: bash
-
-env:
-  PYTHONUNBUFFERED: "1"
-  GH_TOKEN: ${{ github.token }}
-  FORCE_FULL: ${{ github.event.inputs.full_reconcile || 'false' }}
-  LIST_PAGES: ${{ github.event.inputs.list_pages || '0' }}
-  PUBLISHER_LIMIT: ${{ github.event.inputs.publisher_limit || '0' }}
-  DEVELOPER_LIMIT: ${{ github.event.inputs.developer_limit || '0' }}
-
 jobs:
   sweep:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    steps:
-      - name: Check out scripts, workflows and index.json
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            scripts
-            .github
-            index.json
-          sparse-checkout-cone-mode: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: scripts/requirements-meta.txt
-
-      - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check -r scripts/requirements-meta.txt
-
-      - name: Restore crawl-data snapshot
-        id: restore
-        run: |
-          set -euo pipefail
-          bootstrap=false
-          lookup_stderr=$(mktemp)
-          trap 'rm -f "$lookup_stderr"' EXIT
-          if gh release view crawl-data >/dev/null 2>"$lookup_stderr"; then
-            gh release download crawl-data --pattern '*.gz' --clobber
-            for f in *.gz; do
-              if [ -f "$f" ]; then gunzip -f "$f"; fi
-            done
-          elif grep -Eiq 'HTTP 404|404 Not Found|release not found|could not resolve to a Release' "$lookup_stderr"; then
-            bootstrap=true
-          else
-            cat "$lookup_stderr" >&2
-            exit 1
-          fi
-          touch recent-state.json recent-albums.ndjson recent-slugs.txt album-list.pages
-          echo "bootstrap=$bootstrap" >> "$GITHUB_OUTPUT"
-
-
-      - name: Restore the current published library
-        run: |
-          if gh release download --pattern library.json --dir published --clobber; then
-            mv published/library.json published-library.json
-          else
-            echo "no published library yet"
-          fi
-
-      - name: Decide whether this run must reconcile the full baseline
-        id: mode
-        run: |
-          set -euo pipefail
-          full=false
-          reason=incremental
-          if [ "$FORCE_FULL" = "true" ] || [ "$LIST_PAGES" != "0" ] || [ "$PUBLISHER_LIMIT" != "0" ] || [ "$DEVELOPER_LIMIT" != "0" ]; then
-            full=true
-            reason=manual
-          elif [ "${{ steps.restore.outputs.bootstrap }}" = "true" ]; then
-            full=true
-            reason=bootstrap
-          elif compgen -G 'album-list-staging*' >/dev/null || compgen -G 'facet-*-staging*' >/dev/null; then
-            full=true
-            reason=resume
-          elif [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%u)" = "1" ]; then
-            full=true
-            reason=weekly
-          fi
-          for f in album-list.ndjson facet-publisher.ndjson facet-developer.ndjson \
-                   facet-publisher-stats.ndjson facet-developer-stats.ndjson; do
-            if [ ! -s "$f" ]; then
-              full=true
-              reason=bootstrap
-              break
-            fi
-          done
-          echo "full=$full" >> "$GITHUB_OUTPUT"
-          echo "reason=$reason" >> "$GITHUB_OUTPUT"
-          echo "mode: $reason" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Discover recent homepage changes
-        run: |
-          python scripts/crawl_recent.py \
-            --state recent-state.json \
-            --out recent-albums.ndjson \
-            --queue recent-slugs.txt \
-            --metadata album-meta.ndjson \
-            --overlap-days 3 \
-            --max-pages 10 \
-            --deadline-minutes 5
-
-      - name: Reconcile the full album list
-        if: steps.mode.outputs.full == 'true'
-        run: python scripts/crawl_index_pages.py --max-pages "$LIST_PAGES" --fresh --deadline-minutes 45
-
-      - name: Reconcile publisher facets
-        if: steps.mode.outputs.full == 'true'
-        run: python scripts/crawl_facets.py --limit "$PUBLISHER_LIMIT" --kind publisher --fresh --deadline-minutes 90
-
-      - name: Reconcile developer facets
-        if: steps.mode.outputs.full == 'true'
-        run: python scripts/crawl_facets.py --limit "$DEVELOPER_LIMIT" --kind developer --fresh --deadline-minutes 60
-
-      - name: Crawl metadata for recently changed albums
-        if: hashFiles('recent-slugs.txt') != ''
-        run: |
-          python scripts/crawl_album_meta.py \
-            --slugs-file recent-slugs.txt \
-            --refresh \
-            --retry-failures \
-            --order file
-
-      - name: Acknowledge recently refreshed albums
-        if: ${{ success() && hashFiles('recent-slugs.txt') != '' }}
-        run: |
-          python scripts/crawl_recent.py \
-            --ack-only \
-            --state recent-state.json \
-            --out recent-albums.ndjson \
-            --queue recent-slugs.txt \
-            --metadata album-meta.ndjson
-
-      - name: Build library.json
-        run: |
-          python scripts/build_library.py --recent recent-albums.ndjson --gzip \
-            --min-list-coverage 97 \
-            --min-publisher-coverage 55
-
-      - name: Summarise coverage
-        if: always()
-        run: |
-          if [ -f library.json ]; then
-            python scripts/release_notes.py --library library.json \
-              --out release-notes.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "no library.json was built" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Compare library content with the current release
-        id: compare
-        run: |
-          args=(library-changed --current library.json --github-output "$GITHUB_OUTPUT")
-          if [ -f published-library.json ]; then
-            args+=(--previous published-library.json)
-          fi
-          python scripts/publication.py "${args[@]}"
-
-      - name: Publish the library release
-        if: ${{ github.event.inputs.publish != 'false' && steps.compare.outputs.changed == 'true' }}
-        run: |
-          tag="library-$(date -u +%Y%m%d-%H%M)-${GITHUB_RUN_ID}"
-          gh release create "$tag" --draft --title "$tag" --notes-file release-notes.md
-          gh release upload "$tag" library.json library.json.gz
-          gh release edit "$tag" --draft=false --latest
-          echo "published [$tag](https://github.com/${GITHUB_REPOSITORY}/releases/tag/$tag)" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Skip publish when the content is unchanged
-        if: steps.compare.outputs.changed != 'true'
-        run: echo "library content unchanged; skipped release creation" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Keep only the newest seven library releases
-        if: ${{ github.event.inputs.publish != 'false' && steps.compare.outputs.changed == 'true' }}
-        run: |
-          gh release list --limit 100 --json tagName,createdAt,isDraft --jq '
-            [.[] | select(.isDraft == false) | select(.tagName | startswith("library-"))]
-            | sort_by(.createdAt) | reverse | .[7:] | .[].tagName' > stale.txt
-          while read -r tag; do
-            if [ -n "$tag" ]; then gh release delete "$tag" --yes --cleanup-tag; fi
-          done < stale.txt
-
-      - name: Refresh the crawl-data snapshot
-        if: ${{ always() && steps.restore.outcome == 'success' }}
-        run: |
-          set -euo pipefail
-          if ! gh release view crawl-data >/dev/null 2>&1; then
-            gh release create crawl-data --prerelease --title "crawl data" --notes \
-              "Intermediate crawl state shared by the sweep, residual, song-index and wayback workflows."
-          fi
-          files=()
-          for f in album-meta.ndjson album-meta-failures.log metadata-progress.json \
-                   album-list* facet-publisher* facet-developer* \
-                   recent-state.json recent-albums.ndjson recent-slugs.txt; do
-            if [ -f "$f" ] && [[ "$f" != *.gz && "$f" != *.tmp && "$f" != *.bak ]]; then
-              gzip -nkf "$f"
-              files+=("$f.gz")
-            fi
-          done
-          if [ "${#files[@]}" -gt 0 ]; then
-            gh release upload crawl-data "${files[@]}" --clobber
-            # Completed staging generations must not reappear on the next restore.
-            gh release view crawl-data --json assets --jq '.assets[].name' > checkpoint-assets.txt
-            while IFS= read -r asset; do
-              case "$asset" in
-                album-list*staging*.gz|facet-publisher*staging*.gz|facet-developer*staging*.gz)
-                  if [ ! -f "${asset%.gz}" ]; then
-                    gh release delete-asset crawl-data "$asset" --yes
-                  fi
-                  ;;
-              esac
-            done < checkpoint-assets.txt
-          fi
+    uses: ./.github/workflows/live-data.yaml
+    with:
+      mode: refresh
+      minutes: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{0}', inputs.minutes) || '180') }}
+      publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}

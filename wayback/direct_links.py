@@ -14,6 +14,7 @@ from curl_cffi import requests as cr
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 import album_meta
+import live_data
 from khinsider_player import extract_player_urls, valid_mp3_url
 
 BASE = 'https://downloads.khinsider.com'
@@ -21,7 +22,8 @@ DONE_FILE = 'work/direct_done.txt'
 OUT_FILE = 'work/direct_links.jsonl'
 QUEUE_FILE = 'work/direct_queue.txt'
 FAIL_FILE = 'work/direct_failures.log'
-METADATA_FILE = os.environ.get('METADATA_FILE', 'album-meta.ndjson')
+METADATA_FILE = os.environ.get('METADATA_FILE', 'work/live-v2/album-meta.ndjson')
+CATALOGUE_FILE = os.environ.get('CATALOGUE_FILE', 'work/live-v2/catalogue.json')
 MAX_SECONDS = int(os.environ.get('DIRECT_MAX_SECONDS', '0') or 0)
 SCHEMA_VERSION = 2
 LINK_PAT = re.compile(r"https?://[a-z0-9.-]*vgmtreasurechest\.com/soundtracks/[^\"' <>]+\.(?:mp3|flac)", re.I)
@@ -46,33 +48,17 @@ def load_done_from_output(path):
     return done
 
 
+def iter_metadata(path, selected, wanted=None):
+    for number, record in live_data.jsonl(path, missing_ok=True):
+        slug = live_data.canonical_slug(record['slug'])
+        chosen = selected.get(slug)
+        if (chosen and chosen['_line'] == number and record['status'] == 'ok'
+                and (wanted is None or slug in wanted)):
+            yield slug, record
+
+
 def load_metadata(path):
-    out = {}
-    if not path or not os.path.exists(path):
-        return out
-    seq = 0
-    with open_jsonl(path) as fh:
-        for line in fh:
-            seq += 1
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except Exception:
-                continue
-            slug = rec.get('slug')
-            tracks = rec.get('tracks')
-            if not slug or rec.get('tracks_complete') is not True or not isinstance(tracks, list) or not tracks:
-                continue
-            prev = out.get(slug)
-            cur_key = (str(rec.get('crawled_at') or ''), seq)
-            prev_key = (str((prev or {}).get('crawled_at') or ''), (prev or {}).get('_seq', -1))
-            if prev is None or cur_key >= prev_key:
-                copy = dict(rec)
-                copy['_seq'] = seq
-                out[slug] = copy
-    return out
+    return dict(iter_metadata(path, live_data.latest_records(path)))
 
 
 def valid_audio_url(url, slug):
@@ -186,13 +172,11 @@ def main():
     done = load_done_from_output(OUT_FILE)
     if os.path.exists(DONE_FILE):
         done |= set(open(DONE_FILE).read().split()) & done
-    idx = json.load(open('index.json'))
-    slugs = []
-    for v in idx['entries'].values():
-        s = v.rsplit('/', 1)[-1]
-        if s not in done:
-            slugs.append(s)
-    metadata = load_metadata(METADATA_FILE)
+    # Archival history is a completion ledger, never a source of song titles.
+    _, selected, _, _, _ = live_data.require_complete(CATALOGUE_FILE, METADATA_FILE)
+    done = {live_data.canonical_slug(slug) for slug in done}
+    slugs = sorted(set(selected) - done)
+    records = iter_metadata(METADATA_FILE, selected, set(slugs))
     print(f'todo: {len(slugs)} (already done: {len(done)})', flush=True)
 
     out = open(OUT_FILE, 'a', buffering=1)
@@ -202,13 +186,13 @@ def main():
 
     sess = cr.Session(impersonate='chrome')
     try:
-        for i, slug in enumerate(slugs, 1):
+        for i, (slug, metadata_record) in enumerate(records, 1):
             if deadline and time.time() > deadline:
                 print('DIRECT time box reached', flush=True)
                 break
             time.sleep(0.4 + random.random() * 0.6)
             try:
-                queue, summary = process_album(sess, slug, metadata.get(slug))
+                queue, summary = process_album(sess, slug, metadata_record)
                 for url in queue:
                     que.write(url + '\n')
                 out.write(json.dumps(summary, ensure_ascii=False) + '\n')
