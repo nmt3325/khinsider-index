@@ -2,87 +2,100 @@
 
 Builds `library.json`, the metadata file that
 [khinsider-subsonic-relay](https://github.com/nmt3325/khinsider-subsonic-relay)
-serves to Subsonic clients: album title, year, platform, album type, publisher
-and developer for the whole archive.
+serves to Subsonic clients: album title, year, platform, album type, publisher,
+developer, date added, track count, duration, cover and other page metadata.
 
-## Why it is not one request per album
+## Listing sweeps plus full album-page coverage
 
-There are ~104,500 albums. Crawling one page each, politely, takes over a day,
-which does not fit in a GitHub Actions job and is rude to a site that gives
-this away for free.
-
-Almost all of it is available in bulk instead:
+There are roughly 104,600 albums. Listing and facet pages provide basic fields
+cheaply; a resumable full backfill visits every individual album page for the
+remaining fields, whether or not its publisher is already known.
 
 | source | requests | what it yields |
 | --- | --- | --- |
-| `/game-soundtracks?page=N` | 210 | title, platform, type, year for **every** album (500 rows/page) |
-| `/game-soundtracks/publisher/<key>` | ~1,700 | publisher for **79,305** albums (1,625 companies) |
-| `/game-soundtracks/developer/<key>` | ~1,000 | developer for **34,172** albums (961 companies) |
-| `/game-soundtracks/album/<slug>` | 1 per album | everything else: date added, track count, duration, cover, catalogue number, formats |
+| `/game-soundtracks?page=N` | about 210 | title, platform, type, year for every listed album (500 rows/page) |
+| `/game-soundtracks/publisher/<key>` | about 1,700 | publisher assignments from the company listings |
+| `/game-soundtracks/developer/<key>` | about 1,000 | developer assignments from the company listings |
+| `/game-soundtracks/album/<slug>` | 1 per album, plus retries | date added, track count, duration, cover, catalogue number, formats and the other page fields |
 
-So ~2,900 requests - under an hour at one request per second - cover the fields
-that matter. Only the remainder needs per-album pages.
-
-khinsider only lists companies with 11+ albums on the facet index pages, so the
-long tail of small publishers is part of that remainder.
+The bulk passes remain useful for fresh catalog discovery. They are not a
+substitute for individual-page coverage: a known publisher does not mean the
+album's detailed metadata has been fetched. Small companies may not appear
+on the facet index at all.
 
 ## Scripts
 
 | script | role |
 | --- | --- |
-| `album_list.py` | shared fetcher and parser for every list-shaped page (`table.albumList`), Cloudflare-aware retries, resumable state files |
-| `crawl_index_pages.py` | sweeps `/game-soundtracks?page=N` -> `album-list.ndjson` |
-| `crawl_facets.py` | sweeps publisher or developer facets -> `facet-<kind>.ndjson` plus a per-company stats file |
-| `crawl_album_meta.py` | one request per album; used only for the residual queue |
-| `residual_slugs.py` | picks the albums still missing a field, newest first then a stable hash order |
-| `build_library.py` | merges all four sources into `library.json` with a coverage manifest |
-| `release_notes.py` | turns that manifest into release notes / a job summary |
+| `album_list.py` | shared fetcher and parser for listing pages, with retries and resumable state |
+| `crawl_index_pages.py` | flat listing sweep -> `album-list.ndjson` |
+| `crawl_facets.py` | publisher/developer facets -> facet rows and per-company statistics |
+| `crawl_album_meta.py` | resumable individual-page crawler; the full workflow uses `--index library.json` |
+| `metadata_progress.py` | counts fetched, permanently unavailable and pending pages across the whole current library |
+| `residual_slugs.py` | optional manual field-specific selection; no longer used to restrict the full backfill |
+| `build_library.py` | merges all sources into `library.json` with a coverage manifest |
+| `release_notes.py` | converts the manifest into release notes / a job summary |
 
 ### Known, empty, unknown
 
-The merge keeps these three states apart, because a resumable crawl needs to
-tell "we looked and there is nothing" from "we never looked":
+- **known**: a field has a value.
+- **empty**: the field is `null` or `[]`; a source looked and found nothing.
+- **unknown**: the key is absent; no relevant source has looked yet.
 
-- **known** - the field is present with a value
-- **empty** - the field is present as `null` or `[]`: a source looked and the
-  album genuinely has no value
-- **unknown** - the key is *absent*: nothing has looked yet, so
-  `residual_slugs.py` will queue it
-
-When two sources disagree, the album page wins for `year`, `platforms` and
-`album_type`; for `publishers` and `developers` a facet hit beats an empty
-album page, since the facet listing is itself positive evidence.
+A successful page visit can legitimately leave fields empty. Full page
+coverage does not promise a non-empty value for every field on every album.
+The page wins for year/platform/type; a positive company facet hit can fill
+an empty publisher/developer result from the page.
 
 ## Workflows
 
-`album-meta.yaml` (daily) runs the three sweeps in one job, folds in whatever
-album pages have been collected so far, builds `library.json`, and publishes it
-as a dated release. It creates the release as a draft, uploads the assets, then
-un-drafts it, so `releases/latest/download/library.json` never points at a
-half-written file. Coverage gates (`--min-list-coverage`, `--min-publisher-coverage`)
-fail the build rather than publish a library gutted by a site layout change.
-The seven newest library releases are kept.
+`album-meta.yaml` runs the daily listing and facet sweeps. It merges the
+collected page records and publishes a dated library release after coverage
+gates pass. The newest seven library releases are retained.
 
-`album-meta-residual.yaml` (daily) nibbles at the residual queue: ~45 minutes,
-~3 requests per second, ~7k albums per run, then stops and saves state. It
-publishes nothing; its output goes back into the `crawl-data` prerelease and
-the next sweep picks it up.
+`album-meta-residual.yaml` now runs **Album metadata full backfill**:
 
-Intermediate state lives in release assets rather than in git, so the
-repository does not grow by a daily NDJSON snapshot and the two workflows never
-contend for the same commit.
+- Targets **every album in the current published library**, regardless of
+  publisher/year/other existing fields. Previously fetched pages are skipped.
+- Scheduled every **4 hours**, with up to **240 minutes** of crawling per run.
+  Manual dispatch accepts a `minutes` budget from 1 to 240.
+- Keeps the existing conservative pacing: 3 workers, 0.9 seconds delay plus
+  up to 0.6 seconds jitter per worker, and retries with backoff.
+- Saves `album-meta.ndjson` and the failure log to `crawl-data` every
+  **30 minutes** and again at the end, including after a crawl error.
+- Resumes automatically on the next scheduled run. A slice with no progress
+  stops early rather than spending the rest of the run on repeated failures.
+- Treats 404/no-album-content results as unavailable, not fetched. Transient
+  failures stay pending for later retries.
+- Publishes an updated `library.json` after batches add unpublished records,
+  using the same listing/publisher coverage gates as the daily sweep.
+- Writes `metadata-progress.json` to `crawl-data`, separating full-page
+  coverage from the fraction of albums with any basic metadata.
+
+Both workflows share the `khinsider-metadata` concurrency group with
+`cancel-in-progress: false`: only one runs at a time, so checkpoint replacement
+and library publication cannot race. Scheduled runs can wait in GitHub's
+queue; a cron expression is not an exact start-time guarantee.
+
+Library publication is draft -> upload both assets -> publish as latest, so
+clients never see half-uploaded assets. Intermediate state stays in releases,
+not in git. The full backfill fails closed if it cannot restore the existing
+checkpoint or catalog, rather than overwriting collected records with an
+empty restart.
 
 ## Running it by hand
 
 ```sh
 pip install -r scripts/requirements-meta.txt
+python -m unittest discover -s scripts -p 'test_metadata_progress.py' -v
 
-python scripts/crawl_index_pages.py --max-pages 3      # resumable; rerun to continue
-python scripts/crawl_facets.py --kind publisher --limit 20
-python scripts/crawl_facets.py --kind developer --limit 20
-python scripts/build_library.py --pretty --out /tmp/library.json
+# After restoring library.json and the album-meta checkpoint:
+python scripts/metadata_progress.py
+python scripts/crawl_album_meta.py --index library.json --order hash \
+  --deadline-minutes 30 --workers 3 --delay 0.9 --jitter 0.6 --retries 4
+python scripts/metadata_progress.py --summary metadata-progress.json
 ```
 
-Every crawler is resumable: interrupt it and rerun the same command, and it
-skips what it already has. `--fresh` forces a full re-sweep, `--deadline-minutes`
-stops cleanly before a CI timeout.
+Every crawler is resumable. Re-running skips completed work; `--refresh`
+forces per-page re-fetches, and `--deadline-minutes` stops cleanly before a
+runner timeout. Restore the persisted checkpoint before starting a new runner.
