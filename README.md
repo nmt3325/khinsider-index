@@ -1,103 +1,63 @@
 # khinsider-index
-A static file containing a complete index of the content on downloads.khinsider.com
 
-This repo runs the same index functionality built into my [khinsider](https://github.com/marcus-crane/khinsider/tree/v2) tool, just on a timer and uploaded as a file.
+Live album and song metadata for
+[khinsider-subsonic-relay](https://github.com/nmt3325/khinsider-subsonic-relay).
 
-While any user can generate their own index if they choose, by default they'll download a tar gzipped version of the index that is generated and released against this repo, whenever any changes are detected.
+## Current pipeline: standalone live data
 
-Shout outs to [trackiam](https://github.com/glassechidna/trackiam) as inspiration. I've taken the idea a little further with automatic releasing of the files being watched though so feel free to poke around this repo too. I ran into a few gotchas that I've briefly documented.
+The new workflows can start without any historical index or title cache:
 
-I intend to write a fuller README in future
+1. Fetch every page of KHInsider's current album listing and certify the result.
+2. Fetch and validate the complete track list for every catalogue album, resuming
+   this generation's own checkpoint across bounded runs.
+3. Generate `library.json`, `library.json.gz`, `songs.tsv.gz` and `songs-index.json`
+   from that data only. A missing/invalid album track list blocks publication;
+   confirmed HTTP 404s are reported separately.
 
-## Live index rebuild (2026-09, this fork)
+No `index.json`, 2023 album cache, cached song titles, old crawl snapshot or
+previously published library is used to fill missing data. Full acquisition is
+required before the first new serving release. Existing serving releases remain
+available during collection, rather than being replaced with a partial dataset.
 
-The original indexer (`khinsider --debug index`) no longer works:
-downloads.khinsider.com is now behind Cloudflare bot protection which
-hard-blocks datacenter clients and headless browsers.
+See **[the pipeline guide](scripts/README.md)** for schedules, commands, checkpoint
+recovery and completeness limits, and **[the data contract](docs/crawl-contract.md)**
+for producer/relay compatibility.
 
-`scripts/crawl_live.py` rebuilds the index from the **live site** using
-[curl_cffi](https://github.com/lexiforest/curl_cffi) with a Chrome TLS (JA3)
-fingerprint, which passes the protection without a browser:
+### Workflows
 
-    pip install curl_cffi
-    python3 scripts/crawl_live.py
+- `album-meta.yaml`: daily full listing refresh and recent-update discovery.
+- `album-meta-residual.yaml`: bounded full metadata acquisition/resume, every
+  four hours.
+- `song-index.yaml`: complete-only rebuild of the same serving dataset.
+- `live-data.yaml`: shared implementation and serialization for those entry points.
+- `wayback-archive.yaml`: separate archival work; it is not a serving-data input.
+- `tests.yaml`: offline regression and workflow validation.
 
-Result of the 2026-09-01 rebuild: **104,431 albums** (vs 49,536 in
-v0.0.2888 from 2024-01-30; +56,052 added / -1,157 removed). See the
-Releases page for `index.tar.gz` and the diff lists.
+The old `crawl.yaml`, `index.yaml` and `release.yaml` workflows were retired.
+Generated data is kept in releases, not committed back into the source tree.
 
-## Album metadata crawl (2026-09, this fork)
+### Outputs and status
 
-`index.json` / `letters/*.json` only map **title -> album path**. They carry no
-release year, publisher, platform or album type, so anything consuming the index
-(e.g. [khinsider-subsonic-relay](https://github.com/nmt3325/khinsider-subsonic-relay))
-had nothing to show beyond album titles.
+Default distribution URLs remain compatible with the relay:
 
-`scripts/crawl_album_meta.py` visits every album page once and records the info
-block at the top of the page as NDJSON:
+- `releases/latest/download/library.json`
+- `releases/download/song-index/songs.tsv.gz`
+- `releases/download/song-index/songs-index.json`
 
-```sh
-pip install -r scripts/requirements.txt
-python3 scripts/crawl_album_meta.py --limit 200      # smoke test
-python3 scripts/crawl_album_meta.py --letters A,B,C  # one browse section
-python3 scripts/crawl_album_meta.py --shard 1/8      # 8 jobs in parallel
-python3 scripts/crawl_album_meta.py                  # everything, resumable
-```
+New-generation artifacts identify `khinsider-live-v2`, `complete: true` and
+`legacy_inputs: []`. The resumable `live-crawl-v2` checkpoint release is **not**
+a serving release. Check the workflow summary's pending count and publication
+status; a successful time-boxed run need not mean a complete dataset was published.
+A complete catalogue means the validated listing scope, not an instantaneous
+snapshot of all changes on the website.
 
-One line per album in `album-meta.ndjson`:
+## Historical material
 
-```json
-{"slug":"nintendo-3ds-background-music","title":"3DS Background Music","letter":"0-9",
- "year":2011,"publishers":["Nintendo"],"developers":[],"platforms":["3DS"],
- "album_type":"Gamerip","catalog_number":null,"date_added":"2026-04-07",
- "uploaders":["milesthecreator"],"total_filesize":"298 MB (MP3), 757 MB (FLAC)",
- "track_count":106,"duration":9786,"formats":["mp3","flac"],"cover":"https://..."}
-```
+Root `index.json`, `letters/`, `albums/` and older scripts/releases are retained
+for historical reference and are not read by the new serving workflow. Old
+manual scraper/export commands are not the current pipeline.
 
-Then merge it with `index.json` into the `library.json` the relay consumes:
-
-```sh
-python3 scripts/build_library.py --recent recent-albums.ndjson --gzip
-python3 scripts/publication.py library-changed --current library.json --previous previous-library.json
-```
-
-```json
-{"library_version":"2026-09-01","index_version":"live-2026-09-01",
- "album_count":104453,"metadata_count":104100,
- "albums":[{"slug":"...","title":"...","letter":"0-9","year":2011,
-            "publishers":["Nintendo"],"platforms":["3DS"],"album_type":"Gamerip",
-            "date_added":"2026-04-07","track_count":106,"duration":9786}]}
-```
-
-How the relay maps these onto Subsonic tags:
-
-| khinsider | Subsonic |
-|---|---|
-| `Year` | `year`, `releaseDate`, `originalReleaseDate` |
-| `Published by` (fallback `Developed by`) | `artist`, `albumArtist`, `artistId` |
-| `Platforms` | `genre`, `genres[]` |
-| `Album type` | `genre`, `genres[]` |
-| `Date Added` | `created` |
-
-Notes:
-
-- The parser lives in `scripts/album_meta.py` and is shared with the relay's
-  `server.py`; keep the two in sync when the page layout changes.
-- Pacing defaults to 4 workers with a ~0.4-1.0s delay each, i.e. roughly
-  4-6 albums/s in practice but ~7-9 hours for all 104k albums. Cloudflare
-  challenges, 429s and timeouts are retried with exponential backoff; whatever
-  still fails is appended to `album-meta-failures.log` and can be retried with
-  `--retry-failures`.
-- The crawl is resumable: slugs already present in the NDJSON are skipped, so
-  interrupting and rerunning (or sharding across jobs and concatenating the
-  shards) is safe.
-- `scripts/scrape.py` (the old per-album scraper) is superseded by this: it uses
-  plain `requests`, which Cloudflare blocks, and it has a syntax error in its
-  track URL f-string. `albums/*.json` from it is left in place for reference.
-- `.github/workflows/album-meta.yaml` now runs recent discovery every day, bootstraps or
-  reconciles the full listing/facet baseline when needed, refreshes album metadata for the
-  queued recent slugs, and only creates a library release when the album content actually changed.
-- `.github/workflows/album-meta-residual.yaml` keeps the long-running full album-page backfill
-  resumable while reusing the same crawl-data checkpoint assets.
-- `.github/workflows/song-index.yaml` restores canonical album metadata and skips uploads when the
-  published song manifest already matches the rebuilt content.
+This fork originated from [marcus-crane/khinsider-index](https://github.com/marcus-crane/khinsider-index)
+and the [khinsider indexer](https://github.com/marcus-crane/khinsider/tree/v2).
+Credit also to [trackiam](https://github.com/glassechidna/trackiam), an inspiration
+for the original static indexing workflow.

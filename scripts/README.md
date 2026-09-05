@@ -1,115 +1,134 @@
-# Album metadata pipeline
+# Standalone live-data pipeline
 
-Builds `library.json`, the metadata file that
-[khinsider-subsonic-relay](https://github.com/nmt3325/khinsider-subsonic-relay)
-serves to Subsonic clients: album title, year, platform, album type, publisher,
-developer, date added, track count, duration, cover and other page metadata.
+The serving dataset is generated exclusively from the current-generation live
+crawler. A checkout without `index.json`, `albums/`, old title caches or old
+release snapshots can bootstrap it from the website.
 
-## Listing sweeps plus full album-page coverage
-
-There are roughly 104,600 albums. Listing and facet pages provide basic fields
-cheaply; a resumable full backfill visits every individual album page for the
-remaining fields, whether or not its publisher is already known.
-
-| source | requests | what it yields |
-| --- | --- | --- |
-| `/game-soundtracks?page=N` | about 210 | title, platform, type, year for every listed album (500 rows/page) |
-| `/game-soundtracks/publisher/<key>` | about 1,700 | publisher assignments from the company listings |
-| `/game-soundtracks/developer/<key>` | about 1,000 | developer assignments from the company listings |
-| `/game-soundtracks/album/<slug>` | 1 per album, plus retries | date added, track count, duration, cover, catalogue number, formats and the other page fields |
-
-The bulk passes remain useful for fresh catalog discovery. They are not a
-substitute for individual-page coverage: a known publisher does not mean the
-album's detailed metadata has been fetched. Small companies may not appear
-on the facet index at all.
-
-## Scripts
-
-| script | role |
-| --- | --- |
-| `album_list.py` | shared fetcher and parser for listing pages, with retries and resumable state |
-| `crawl_index_pages.py` | flat listing sweep -> `album-list.ndjson` |
-| `crawl_facets.py` | publisher/developer facets -> facet rows and per-company statistics |
-| `crawl_album_meta.py` | resumable individual-page crawler; the full workflow uses `--index library.json` |
-| `metadata_progress.py` | counts fetched, permanently unavailable and pending pages across the whole current library |
-| `residual_slugs.py` | optional manual field-specific selection; no longer used to restrict the full backfill |
-| `build_library.py` | merges all sources into `library.json` with a coverage manifest; `--recent` overlays newly discovered albums before enrichment |
-| `publication.py` | compares library/song-index content identities so workflows can skip unchanged releases |
-| `release_notes.py` | converts the manifest into release notes / a job summary |
-
-### Known, empty, unknown
-
-- **known**: a field has a value.
-- **empty**: the field is `null` or `[]`; a source looked and found nothing.
-- **unknown**: the key is absent; no relevant source has looked yet.
-
-A successful page visit can legitimately leave fields empty. Full page
-coverage does not promise a non-empty value for every field on every album.
-The page wins for year/platform/type; a positive company facet hit can fill
-an empty publisher/developer result from the page.
-
-## Workflows
-
-`album-meta.yaml` now runs recent discovery every day, restores the latest
-listing/facet/recent checkpoints, refreshes album metadata for the queued
-recent slugs, and performs a full listing/facet reconciliation weekly (or on
-manual request / bootstrap). It publishes only when the album content changed,
-not merely because generation timestamps or diagnostics did. The newest seven
-library releases are retained.
-
-`album-meta-residual.yaml` now runs **Album metadata full backfill**:
-
-- Targets **every album in the current published library**, regardless of
-  publisher/year/other existing fields. Previously fetched pages are skipped.
-- Scheduled every **4 hours**, with up to **240 minutes** of crawling per run.
-  Manual dispatch accepts a `minutes` budget from 1 to 240.
-- Keeps the existing conservative pacing: 3 workers, 0.9 seconds delay plus
-  up to 0.6 seconds jitter per worker, and retries with backoff.
-- Saves `album-meta.ndjson` and the failure log to `crawl-data` every
-  **30 minutes** and again at the end, including after a crawl error.
-- Resumes automatically on the next scheduled run. A slice with no progress
-  stops early rather than spending the rest of the run on repeated failures.
-- Treats 404/no-album-content results as unavailable, not fetched. Transient
-  failures stay pending for later retries.
-- Publishes an updated `library.json` after batches add unpublished records,
-  using the same listing/publisher coverage gates as the daily sweep and the
-  same content-hash guard as the daily publisher.
-- Writes `metadata-progress.json` to `crawl-data`, separating full-page
-  coverage from the fraction of albums with any basic metadata.
-
-Both workflows share the `khinsider-metadata` concurrency group with
-`cancel-in-progress: false`: only one runs at a time, so checkpoint replacement
-and library publication cannot race. Scheduled runs can wait in GitHub's
-queue; a cron expression is not an exact start-time guarantee.
-
-Library publication is draft -> upload both assets -> publish as latest, so
-clients never see half-uploaded assets. Intermediate state stays in releases,
-not in git. The full backfill fails closed if it cannot restore the existing
-checkpoint or catalog, rather than overwriting collected records with an
-empty restart.
-
-## Running it by hand
-
-```sh
-pip install -r scripts/requirements-meta.txt
-python -m unittest discover -s scripts -p 'test_metadata_progress.py' -v
-
-# After restoring library.json and the album-meta checkpoint:
-python scripts/metadata_progress.py
-python scripts/crawl_album_meta.py --index library.json --order hash \
-  --deadline-minutes 30 --workers 3 --delay 0.9 --jitter 0.6 --retries 4
-python scripts/metadata_progress.py --summary metadata-progress.json
+```text
+Full paginated album listing -> certified catalogue.json
+                                  |
+Homepage updates -> pending events + full album-page/track crawl
+                                  |
+                 strict completeness and provenance checks
+                                  |
+          library.json(.gz) + songs.tsv.gz + songs-index.json
 ```
 
-Every crawler is resumable. Re-running skips completed work; `--refresh`
-forces per-page re-fetches, and `--deadline-minutes` stops cleanly before a
-runner timeout. Restore the persisted checkpoint before starting a new runner.
+## What “complete” means
 
-`build_library.py` drops canonical `tracks` arrays when it reads `album-meta.ndjson`, so the
-library keeps the existing album-focused API even after the track-aware metadata crawl lands.
+- Every page in the full `/game-soundtracks` listing was fetched. The catalogue
+  records the page set, advertised album count, observations and a content hash.
+  Unique albums must meet the advertised count; capped/incoherent sweeps do not
+  replace the last-good catalogue.
+- Every album in that catalogue must have a validated, nonempty, complete track
+  list from this crawler generation, or a separately reported HTTP 404 observed
+  since the listing sweep began. Previously missing albums are rechecked after
+  a new listing. An HTTP 200 with a missing/malformed songlist stays pending.
+- Recent events for catalogue albums require a later successful page observation.
+  A capped recent scan retains its page cursor and cannot authorize publication.
+- The first partial backfill is **not** a serving release. Missing tracks cannot
+  be filled from old indexes, filename reconstruction or historical title caches.
+- Completeness is relative to the certified listing and observed updates, not an
+  instantaneous snapshot of a changing website. Daily full listing refreshes
+  bring newly listed albums into scope; unlisted recent slugs are not unioned
+  into an uncertified catalogue. Unannounced page edits are not detected instantly.
+- Optional publisher/developer/date/format fields can legitimately be empty.
+  They are not fabricated or filled from older data. Facet enrichment is not a
+  required input, and field richness is not claimed to exceed historical data.
 
+## One engine, three entry points
 
-## Offline regression tests and bounded full sweeps
+All serving workflows call `live-data.yaml` / `scripts/live_pipeline.py` and
+share one `khinsider-metadata` concurrency lock with cancellation disabled.
+
+| Entry point | Purpose | Default schedule/budget |
+| --- | --- | --- |
+| `album-meta.yaml` | Refresh the complete listing, discover updates, collect pending album pages | Daily 03:20 UTC; 180 minutes |
+| `album-meta-residual.yaml` | Bootstrap or resume missing/changed modern records | Every 4 hours at :40 UTC; 240 minutes |
+| `song-index.yaml` | Rebuild both serving outputs from an already complete modern checkpoint | Monday 05:17 UTC; no discovery |
+
+Manual sweep/backfill inputs are `minutes` (1–240) and `publish`. Old
+`full_reconcile`, listing/facet caps and legacy song-source inputs were removed.
+The weekly rebuild also has a `publish` input. Schedule times are not guaranteed
+start times: GitHub can queue runs behind another writer.
+
+Metadata work uses at most 3 workers, 0.9 seconds delay plus up to 0.6 seconds
+jitter per worker, retries with backoff, and slices of at most 25 minutes.
+Only pending/newly changed albums are queued. No-progress slices stop early.
+Full listing stages and recent-page cursors resume across bounded runs.
+
+## Checkpoints are not published libraries
+
+The new pipeline only restores `checkpoint.tar.gz` from the prerelease tag
+`live-crawl-v2`. Its descriptor identifies `khinsider-live-v2` and stores per-file
+sizes and SHA-256 hashes. Restore rejects foreign generations, corrupt hashes,
+unsafe tar members and nonempty local destinations. Only a genuinely missing
+release is a bootstrap; authentication/transport failures and a missing asset on
+an existing release stop the run.
+
+The checkpoint includes the catalogue, staged listing rows/ledger, complete
+modern metadata records, failures, discovery state and publication state.
+Partial progress is saved between slices and at the end. Final save is guarded
+by successful restore. Actions also keeps a short-lived recovery artifact.
+The archive replaces locally only after validation; failed uploads do not imply
+that the new state reached GitHub.
+
+`crawl-data`, `song-urls-*`, `songs_cached.jsonl.gz`, `crawl_state_snapshot.tar.gz`,
+`index.json` and previously published libraries are **never generation inputs**.
+Old files/releases remain historical or last-good serving data during initial
+collection, not hole-filling sources. Reusing this new pipeline's own checkpoint
+is permitted and avoids starting 100,000+ album requests over every run.
+
+## Publication and relay compatibility
+
+Both builders require complete inputs before touching their output files. There
+is no `--allow-partial` or legacy-cache merge path. The song builder preserves
+separate actual tracks even when their displayed titles/numbers are identical.
+Gzip output has a deterministic timestamp and filename header.
+
+Publication validates provenance, catalogue identity, counts, metadata/TSV
+hashes, the stored manifest and compressed library. It uploads all four files to
+a draft `library-live-v2-*` release. It then updates the compatible `song-index`
+payload before its manifest and finally publishes the library release as latest.
+Existing default relay URLs therefore remain valid.
+
+GitHub does not provide a transaction spanning these releases/assets. Readers
+must retain last-good data when a payload/manifest pair is inconsistent. No
+release deletion is performed. Equal content skips publication using this
+pipeline's own publication checkpoint, not the old serving data as crawl input.
+
+`progress.json` / the job summary distinguish `fetched`, `unavailable`, `pending`,
+`tracks`, `ready_for_publish` and `published`. A green bounded collection job can
+still have `published: false`. Initial full acquisition may take multiple runs.
+Code deployment, complete acquisition, release publication and running-relay
+uptake are separate milestones.
+
+## Local use (from repository root)
+
+```sh
+python -m pip install -r scripts/requirements-meta.txt
+# Fresh temporary workspace; no legacy files need to be copied here.
+python scripts/live_pipeline.py run --state-dir work/live-v2 --mode refresh --minutes 30
+python scripts/live_pipeline.py status --state-dir work/live-v2
+# Run again to continue; publication is OFF unless --publish is supplied.
+python scripts/live_pipeline.py run --state-dir work/live-v2 --mode backfill --minutes 30
+```
+
+On a new runner, restore the new generation before collecting. The scheduled
+workflow performs these steps automatically:
+
+```sh
+python scripts/live_pipeline.py restore --repo nmt3325/khinsider-index
+python scripts/live_pipeline.py run --repo nmt3325/khinsider-index \
+  --mode backfill --minutes 240 --checkpoint --publish
+python scripts/live_pipeline.py save --repo nmt3325/khinsider-index
+```
+
+Do not restore into nonempty local state or manually import old metadata into
+`work/live-v2`. Keep a damaged checkpoint aside for investigation rather than
+silently replacing it with a fresh partial run.
+
+## Offline tests
 
 ```sh
 python -m pip install -r scripts/requirements-meta.txt pytest ruff pyyaml
@@ -117,13 +136,7 @@ PYTHONPATH=scripts:wayback python -m pytest -q scripts wayback test_shared_playe
 ruff check --select E9,F63,F7,F82 scripts wayback test_shared_player.py
 ```
 
-Run these from the repository root. Fixtures are committed in the repository;
-these tests do not crawl KHInsider, fetch audio, or submit archive requests.
-
-The manual daily-workflow entry retains `list_pages`, `publisher_limit`, and
-`developer_limit` (`0` means unlimited). Manual runs default to
-`full_reconcile=true`; explicitly set it to false for an incremental-only
-run when a complete baseline already exists and no staging remains.
-Scheduled full reconciliation is weekly (Monday UTC), with daily resumption
-of unfinished staging. Bounded or failed full runs keep the live baseline
-and checkpoint their unfinished work instead of publishing a partial catalog.
+Tests cover cold bootstrap without legacy inputs, resume, full-list/track gates,
+Unicode paths, metadata acknowledgment, deterministic artifacts, corrupt
+checkpoints, publication failures and relay compatibility. Test catalogues with a
+few albums are synthetic fixtures, never evidence of a complete live-site crawl.

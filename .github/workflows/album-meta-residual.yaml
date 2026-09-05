@@ -1,176 +1,26 @@
-# Fetch every individual album page, even when listing/facet metadata exists.
 name: Album metadata full backfill
 
 on:
   schedule:
-    - cron: "40 */4 * * *"
+    - cron: '40 */4 * * *'
   workflow_dispatch:
     inputs:
       minutes:
-        description: "Crawl time budget in minutes (1-240)"
-        default: "240"
-
-concurrency:
-  group: khinsider-metadata
-  cancel-in-progress: false
+        description: 'Collection budget in minutes (1–240)'
+        type: number
+        default: 240
+      publish:
+        description: 'Publish only when the live-only collection is complete'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
-defaults:
-  run:
-    shell: bash
-
-env:
-  PYTHONUNBUFFERED: "1"
-  GH_TOKEN: ${{ github.token }}
-  MINUTES: ${{ github.event.inputs.minutes || '240' }}
-
 jobs:
   backfill:
-    runs-on: ubuntu-latest
-    timeout-minutes: 330
-    steps:
-      - name: Check out scripts, workflows and index.json
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            scripts
-            .github
-            index.json
-          sparse-checkout-cone-mode: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: scripts/requirements-meta.txt
-
-      - name: Install dependencies and test progress accounting
-        run: |
-          python -m pip install --disable-pip-version-check -r scripts/requirements-meta.txt
-          python -m unittest discover -s scripts -p 'test_metadata_progress.py' -v
-
-      - name: Validate the time budget
-        run: |
-          python - <<'PY' >> "$GITHUB_ENV"
-          import os
-          minutes = int(os.environ['MINUTES'])
-          if not 1 <= minutes <= 240:
-              raise SystemExit('minutes must be an integer between 1 and 240')
-          print(f'MINUTES={minutes}')
-          PY
-
-      - name: Restore the checkpoint, recent state and current catalog
-        id: restore
-        run: |
-          set -euo pipefail
-          gh release download crawl-data --pattern '*.gz' --clobber
-          for f in *.gz; do
-            if [ -f "$f" ]; then gunzip -f "$f"; fi
-          done
-          test -s album-meta.ndjson
-          gh release download --pattern library.json --clobber
-          touch recent-state.json recent-albums.ndjson recent-slugs.txt album-list.pages
-
-      - name: Measure initial full-catalog coverage
-        id: before
-        run: |
-          python scripts/metadata_progress.py --summary metadata-progress.json \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: Crawl all remaining album pages with checkpoints
-        if: steps.before.outputs.pending != '0'
-        run: |
-          deadline=$((SECONDS + MINUTES * 60))
-          while (( SECONDS < deadline )); do
-            python scripts/metadata_progress.py --summary metadata-progress.json
-            pending_before=$(jq -r '.pending' metadata-progress.json)
-            if [ "$pending_before" -eq 0 ]; then break; fi
-            seconds_left=$((deadline - SECONDS))
-            if [ "$seconds_left" -le 0 ]; then break; fi
-            slice=$(python -c 'import sys; print(min(1800, int(sys.argv[1])) / 60)' "$seconds_left")
-            python scripts/crawl_album_meta.py \
-              --index library.json --order hash \
-              --deadline-minutes "$slice" \
-              --workers 3 --delay 0.9 --jitter 0.6 --retries 4 \
-              --progress-every 200
-
-            files=()
-            for f in album-meta.ndjson album-meta-failures.log metadata-progress.json \
-                     album-list* facet-publisher* facet-developer* \
-                     recent-state.json recent-albums.ndjson recent-slugs.txt; do
-              if [ -f "$f" ] && [[ "$f" != *.gz && "$f" != *.tmp && "$f" != *.bak ]]; then
-                gzip -nkf "$f"
-                files+=("$f.gz")
-              fi
-            done
-            gh release upload crawl-data "${files[@]}" --clobber
-            python scripts/metadata_progress.py --summary metadata-progress.json
-            pending_after=$(jq -r '.pending' metadata-progress.json)
-            gh release upload crawl-data metadata-progress.json --clobber
-            if [ "$pending_after" -ge "$pending_before" ]; then
-              echo 'No progress in this slice; leaving transient failures for a later scheduled retry.'
-              break
-            fi
-          done
-
-      - name: Save the final checkpoint even after a crawl error
-        id: save
-        if: ${{ always() && steps.restore.outcome == 'success' }}
-        run: |
-          files=()
-          for f in album-meta.ndjson album-meta-failures.log metadata-progress.json \
-                   album-list* facet-publisher* facet-developer* \
-                   recent-state.json recent-albums.ndjson recent-slugs.txt; do
-            if [ -f "$f" ] && [[ "$f" != *.gz && "$f" != *.tmp && "$f" != *.bak ]]; then
-              gzip -nkf "$f"
-              files+=("$f.gz")
-            fi
-          done
-          gh release upload crawl-data "${files[@]}" --clobber
-
-      - name: Report fetched, unavailable and still-pending albums
-        id: after
-        if: ${{ always() && steps.save.outcome == 'success' }}
-        run: |
-          python scripts/metadata_progress.py --summary metadata-progress.json \
-            --github-output "$GITHUB_OUTPUT" --markdown "$GITHUB_STEP_SUMMARY"
-          gh release upload crawl-data metadata-progress.json --clobber
-
-      - name: Build the updated library
-        if: ${{ success() && steps.after.outputs.fetched != '' && steps.before.outputs.published_fetched != '' && fromJSON(steps.after.outputs.fetched) > fromJSON(steps.before.outputs.published_fetched) }}
-        run: |
-          python scripts/build_library.py --out library-next.json --recent recent-albums.ndjson --gzip \
-            --min-list-coverage 97 --min-publisher-coverage 55
-          python scripts/release_notes.py --library library-next.json \
-            --out release-notes.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Compare the rebuilt library with the current release
-        id: compare
-        if: ${{ success() && hashFiles('library-next.json') != '' }}
-        run: |
-          python scripts/publication.py library-changed \
-            --current library-next.json \
-            --previous library.json \
-            --github-output "$GITHUB_OUTPUT"
-
-      - name: Promote the rebuilt library
-        if: ${{ steps.compare.outputs.changed == 'true' }}
-        run: |
-          mv library-next.json library.json
-          mv library-next.json.gz library.json.gz
-
-      - name: Publish the updated library atomically
-        if: ${{ steps.compare.outputs.changed == 'true' }}
-        run: |
-          tag="library-$(date -u +%Y%m%d-%H%M)-${GITHUB_RUN_ID}"
-          gh release create "$tag" --draft --title "$tag" --notes-file release-notes.md
-          gh release upload "$tag" library.json library.json.gz
-          gh release edit "$tag" --draft=false --latest
-          echo "Published $tag" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Skip publish when the rebuilt content is unchanged
-        if: ${{ hashFiles('library-next.json') != '' && steps.compare.outputs.changed != 'true' }}
-        run: echo "library content unchanged; skipped release creation" >> "$GITHUB_STEP_SUMMARY"
+    uses: ./.github/workflows/live-data.yaml
+    with:
+      mode: backfill
+      minutes: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{0}', inputs.minutes) || '240') }}
+      publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}

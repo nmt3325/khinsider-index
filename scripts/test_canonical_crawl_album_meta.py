@@ -2,6 +2,7 @@ import json
 import time
 
 import crawl_album_meta
+from live_test_helpers import record
 
 
 def test_dedupe_targets_preserves_first_file_order():
@@ -15,8 +16,8 @@ def test_filter_targets_with_refresh_days(tmp_path):
     old = time.strftime(crawl_album_meta.TIME_FMT, time.gmtime(now - 10 * 86400))
     recent = time.strftime(crawl_album_meta.TIME_FMT, time.gmtime(now - 86400))
     out.write_text('\n'.join([
-        json.dumps({'slug': 'old', 'crawled_at': old}),
-        json.dumps({'slug': 'recent', 'crawled_at': recent}),
+        json.dumps(record('old', when=old)),
+        json.dumps(record('recent', when=recent)),
     ]) + '\n', encoding='utf-8')
     done = crawl_album_meta.load_done(str(out))
     todo = crawl_album_meta.filter_targets([('old', 'old'), ('recent', 'recent'), ('new', 'new')],

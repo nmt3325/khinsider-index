@@ -111,7 +111,8 @@ def derive_letter(title):
 
 def song_page_path(slug, basename):
     return '/game-soundtracks/album/%s/%s' % (
-        urllib.parse.quote(slug), urllib.parse.quote(str(basename or ''), safe=''))
+        urllib.parse.quote(urllib.parse.unquote(slug), safe=''),
+        urllib.parse.quote(str(basename or ''), safe=''))
 
 
 def song_page_url(slug, basename, base='https://downloads.khinsider.com'):
@@ -226,11 +227,13 @@ def _songlist_roles(table):
 
 
 def _row_basename(tr, slug):
-    prefix = '/game-soundtracks/album/%s/' % slug
-    for a in tr.find_all('a', href=True):
-        path = urllib.parse.urlparse(a['href']).path
-        if prefix in path and AUDIO_EXT_RE.search(path):
-            return urllib.parse.unquote(path.rsplit('/', 1)[-1])
+    wanted = urllib.parse.unquote(slug)
+    for anchor in tr.find_all('a', href=True):
+        path = urllib.parse.urlparse(anchor['href']).path
+        parts = path.split('/')
+        if (len(parts) == 5 and parts[1:3] == ['game-soundtracks', 'album']
+                and urllib.parse.unquote(parts[3]) == wanted and AUDIO_EXT_RE.search(path)):
+            return urllib.parse.unquote(parts[4])
     return None
 
 
@@ -295,6 +298,12 @@ def parse_songlist(soup, slug, player_urls=None):
         tracks.append(t)
     if not tracks:
         raise SonglistError('empty songlist')
+    observed_ids = [str(node.get('songid')) for node in table.select('.playlistAddTo[songid]')]
+    parsed_ids = [track.get('songid') for track in tracks]
+    if observed_ids and (len(observed_ids) != len(tracks)
+                         or len(set(observed_ids)) != len(observed_ids)
+                         or set(observed_ids) != set(parsed_ids)):
+        raise SonglistError('songlist rows were omitted or duplicated')
     if player_urls:
         row_songids = [t.get('songid') for t in tracks]
         if any(not s for s in row_songids):
