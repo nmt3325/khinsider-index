@@ -1,4 +1,4 @@
-name: Album metadata full backfill
+name: Incremental updates and pending backfill
 
 on:
   schedule:
@@ -10,7 +10,7 @@ on:
         type: number
         default: 240
       publish:
-        description: 'Publish only when the live-only collection is complete'
+        description: 'Publish all accumulated valid records while failed requests remain queued'
         type: boolean
         default: true
 

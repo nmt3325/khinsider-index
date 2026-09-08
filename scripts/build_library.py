@@ -27,15 +27,15 @@ def merge_field(album, field, primary, secondary, is_list=False):
 
 
 def build_payload(args):
-    catalogue, records, unavailable, _, summary = live_data.require_complete(
-        args.catalogue, args.meta, args.recent_state)
+    reader = live_data.require_cumulative if getattr(args, 'cumulative', False) else live_data.require_complete
+    catalogue, records, unavailable, _, summary = reader(args.catalogue, args.meta, args.recent_state)
     albums = []
     tracked = ('year', 'platforms', 'album_type', 'publishers', 'developers', 'date_added')
     tally = {field: {'known': 0, 'empty': 0, 'unknown': 0} for field in tracked}
     for row in catalogue['albums']:
         slug = row['slug']
         if slug not in records:
-            continue  # Only explicitly reported HTTP-404 albums reach this branch.
+            continue  # Missing new albums stay queued; existing complete records remain included.
         record = records[slug]
         name = record['title']
         album = {'slug': slug, 'title': name,
@@ -56,11 +56,16 @@ def build_payload(args):
         'source': 'https://github.com/nmt3325/khinsider-index',
         'data_source': live_data.SOURCE, 'dataset_schema_version': live_data.SCHEMA,
         'complete': True, 'catalogue_id': catalogue['catalogue_id'],
+        'completeness_scope': summary.get('completeness_scope', 'certified_catalogue'),
+        'crawl_complete': summary['complete'],
+        'alias_count': summary.get('alias_count', 0),
         'album_count': len(albums), 'metadata_count': len(albums),
         'unavailable_albums': unavailable, 'legacy_inputs': [],
         'coverage': {
             'albums': len(albums), 'listed_albums': summary['total'],
-            'pending': 0, 'unavailable': len(unavailable),
+            'pending': summary['pending'], 'unavailable': len(unavailable),
+            'missing_albums': summary.get('missing_albums', 0),
+            'retained_last_good': summary.get('retained_last_good', 0),
             'sources': {
                 'album_list': {'albums': len(albums), 'rows': summary['total'],
                                'pages_swept': catalogue['listing']['pages']},
@@ -88,6 +93,7 @@ def build_arg_parser():
     parser.add_argument('--catalogue', default='catalogue.json')
     parser.add_argument('--meta', default='album-meta.ndjson')
     parser.add_argument('--recent-state', default=None)
+    parser.add_argument('--cumulative', action='store_true', help='Emit all validated accumulated albums, not just this run’s changes')
     parser.add_argument('--out', default='library.json')
     parser.add_argument('--gzip', action='store_true')
     parser.add_argument('--pretty', action='store_true')

@@ -40,12 +40,14 @@ def create_db(path):
 
 
 def ingest_metadata(connection, path, selected):
+    selected_lines = {record['_line']: slug for slug, record in selected.items()}
     for number, record in live_data.jsonl(path):
-        slug = live_data.canonical_slug(record.get('slug'))
-        chosen = selected.get(slug)
-        if chosen is None or number != chosen['_line']:
+        slug = selected_lines.get(number)
+        if slug is None:
             continue
-        live_data.validate_record(record)
+        requested = live_data.validate_record(record)
+        if slug not in (requested, record.get('resolved_slug')):
+            raise BuildError('selected metadata album identity changed')
         connection.execute('INSERT INTO albums VALUES (?)', (slug,))
         connection.executemany('INSERT INTO tracks VALUES (?,?,?,?,?)', [
             (slug, position, track.get('disc'), track.get('num'), sanitize_field(track['title']))
@@ -63,7 +65,7 @@ def build_raw_tsv(connection, path):
         # title/disc/number. Legacy UNION/DISTINCT fallback logic is removed.
         query = 'SELECT slug, disc, num, title FROM tracks ORDER BY slug, position'
         for slug, disc, num, title in connection.execute(query):
-            stream.write('%s\t%s\t%s\t%s\n' % (slug, disc or '', num or '', title))
+            stream.write('%s\t%s\t%s\t%s\n' % (slug, '' if disc is None else disc, '' if num is None else num, title))
             count += 1
     if not count:
         raise BuildError('refusing to generate an empty song index')
@@ -100,13 +102,14 @@ def main(argv=None):
     parser.add_argument('--catalogue', default='catalogue.json')
     parser.add_argument('--metadata', default='album-meta.ndjson')
     parser.add_argument('--recent-state', default=None)
+    parser.add_argument('--cumulative', action='store_true', help='Emit the full accumulated snapshot')
     parser.add_argument('--out', default='songs.tsv.gz')
     parser.add_argument('--manifest', default='songs-index.json')
     parser.add_argument('--compresslevel', type=int, default=6)
     args = parser.parse_args(argv)
     started = time.time()
-    _, selected, unavailable, _, progress = live_data.require_complete(
-        args.catalogue, args.metadata, args.recent_state)
+    reader = live_data.require_cumulative if args.cumulative else live_data.require_complete
+    _, selected, unavailable, _, progress = reader(args.catalogue, args.metadata, args.recent_state)
     before = digest_file(args.metadata)
     output = Path(args.out)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +129,10 @@ def main(argv=None):
         manifest = {
             'schema_version': SCHEMA_VERSION, 'dataset_schema_version': live_data.SCHEMA,
             'data_source': live_data.SOURCE, 'complete': True, 'legacy_inputs': [],
+            'completeness_scope': progress.get('completeness_scope', 'certified_catalogue'),
+            'crawl_complete': progress['complete'], 'pending_albums': progress['pending'],
+            'retained_last_good': progress.get('retained_last_good', 0),
+            'alias_count': progress.get('alias_count', 0),
             'generated': live_data.now(), 'catalogue_id': progress['catalogue_id'],
             'songs': count, 'albums': len(selected), 'songs_from_metadata': count,
             'library_albums': len(selected), 'library_albums_covered': len(selected),

@@ -228,11 +228,14 @@ def _songlist_roles(table):
 
 def _row_basename(tr, slug):
     wanted = urllib.parse.unquote(slug)
+    add_to = tr.select_one('.playlistAddTo[songid]')
+    identified_track = add_to is not None and str(add_to.get('songid', '')).isdecimal()
     for anchor in tr.find_all('a', href=True):
-        path = urllib.parse.urlparse(anchor['href']).path
+        path = urllib.parse.urlsplit(anchor['href']).path
         parts = path.split('/')
         if (len(parts) == 5 and parts[1:3] == ['game-soundtracks', 'album']
-                and urllib.parse.unquote(parts[3]) == wanted and AUDIO_EXT_RE.search(path)):
+                and urllib.parse.unquote(parts[3]) == wanted and parts[4]
+                and (AUDIO_EXT_RE.search(path) or identified_track)):
             return urllib.parse.unquote(parts[4])
     return None
 
