@@ -1,4 +1,4 @@
-name: Album metadata sweep
+name: Daily incremental album updates
 
 on:
   schedule:
@@ -8,9 +8,9 @@ on:
       minutes:
         description: 'Collection budget in minutes (1–240)'
         type: number
-        default: 180
+        default: 20
       publish:
-        description: 'Publish only when all current albums have complete tracks'
+        description: 'Publish the full accumulated index, never only the daily delta'
         type: boolean
         default: true
 
@@ -21,6 +21,6 @@ jobs:
   sweep:
     uses: ./.github/workflows/live-data.yaml
     with:
-      mode: refresh
-      minutes: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{0}', inputs.minutes) || '180') }}
+      mode: incremental
+      minutes: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{0}', inputs.minutes) || '20') }}
       publish: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}

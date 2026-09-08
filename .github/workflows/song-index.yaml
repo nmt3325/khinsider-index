@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: 'Rebuild and publish the complete live-only serving pair'
+        description: 'Rebuild the full accumulated serving pair without crawling'
         type: boolean
         default: true
 

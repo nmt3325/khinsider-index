@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import threading
 import time
 import urllib.parse
@@ -19,8 +20,6 @@ import live_data
 
 BASE = 'https://downloads.khinsider.com'
 ALBUM_PREFIX = '/game-soundtracks/album/'
-CF_MARKERS = ('attention required', 'just a moment', 'cf-browser-verification',
-              'enable javascript and cookies to continue')
 PERMANENT_NOTES = ('gone',)
 TIME_FMT = '%Y-%m-%dT%H:%M:%SZ'
 _local = threading.local()
@@ -114,7 +113,7 @@ def filter_targets(targets, done, failures_path, refresh=False,
 
 
 def fetch(slug, retries, delay, jitter):
-    """Fetch an album page. Returns (html, status) with html=None on failure."""
+    """Return (html, status, final_url); never mistake an album title for a challenge."""
     url = BASE + ALBUM_PREFIX + live_data.canonical_slug(slug)
     for attempt in range(retries):
         time.sleep(delay + random.random() * jitter)
@@ -125,17 +124,21 @@ def fetch(slug, retries, delay, jitter):
         else:
             status = r.status_code
             if r.status_code == 404:
-                return None, 'gone'
+                return None, 'gone', getattr(r, 'url', url)
             if r.status_code == 200:
                 low = r.text[:4000].lower()
-                if any(m in low for m in CF_MARKERS):
+                title = re.search(r'<title[^>]*>(.*?)</title>', low, re.S)
+                heading = title.group(1).strip() if title else ''
+                challenge = (heading in ('just a moment...', 'just a moment…', 'attention required! | cloudflare')
+                             or 'cf-browser-verification' in low or 'cf-chl-' in low)
+                if challenge:
                     status = 'cloudflare'
                 else:
-                    return r.text, 200
+                    return r.text, 200, getattr(r, 'url', url)
         backoff = min(60, (2 ** attempt) * 2) + random.random() * 3
         if attempt < retries - 1:
             time.sleep(backoff)
-    return None, status
+    return None, status, url
 
 
 def main(argv=None):
@@ -210,16 +213,24 @@ def main(argv=None):
 
     def worker(item):
         slug, title = item
-        html, status = fetch(slug, args.retries, args.delay, args.jitter)
+        fetched = fetch(slug, args.retries, args.delay, args.jitter)
+        html, status = fetched[:2]
+        final_url = fetched[2] if len(fetched) > 2 else BASE + ALBUM_PREFIX + slug
         record, note = None, None
         observed_at = time.strftime(TIME_FMT, time.gmtime())
         if html is not None:
             try:
-                record = album_meta.album_record(slug, BeautifulSoup(html, 'html.parser'), html=html)
+                parsed = urllib.parse.urlsplit(final_url)
+                parts = parsed.path.split('/')
+                if (parsed.scheme not in ('https', 'http') or parsed.hostname != 'downloads.khinsider.com'
+                        or len(parts) != 4 or parts[1:3] != ['game-soundtracks', 'album'] or not parts[3]):
+                    raise album_meta.SonglistError('redirected outside an album page')
+                resolved = live_data.canonical_slug(parts[3])
+                record = album_meta.album_record(resolved, BeautifulSoup(html, 'html.parser'), html=html)
                 if record is None:
                     note = 'no album content'
                 else:
-                    record.update(data_source=live_data.SOURCE, status='ok',
+                    record.update(slug=slug, resolved_slug=resolved, data_source=live_data.SOURCE, status='ok',
                                   http_status=200, crawled_at=observed_at)
                     live_data.validate_record(record)
             except (album_meta.SonglistError, live_data.DataError) as exc:

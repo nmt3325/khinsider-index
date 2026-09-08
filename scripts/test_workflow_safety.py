@@ -33,8 +33,8 @@ def test_checkout_does_not_supply_the_legacy_index():
         assert forbidden not in text
 
 
-def test_every_serving_workflow_uses_the_same_complete_only_engine():
-    for name, mode in [('album-meta.yaml', 'refresh'), ('album-meta-residual.yaml', 'backfill'), ('song-index.yaml', 'build')]:
+def test_every_serving_workflow_uses_the_same_cumulative_engine():
+    for name, mode in [('album-meta.yaml', 'incremental'), ('album-meta-residual.yaml', 'backfill'), ('song-index.yaml', 'build')]:
         jobs = load(name)['jobs']
         assert len(jobs) == 1
         job = next(iter(jobs.values()))

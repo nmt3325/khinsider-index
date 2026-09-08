@@ -186,6 +186,8 @@ def validate_record(record):
     if record.get('data_source') != SOURCE:
         raise DataError(f'{slug}: legacy/unattributed metadata is not accepted')
     stamp(record.get('crawled_at'))
+    if 'resolved_slug' in record and canonical_slug(record['resolved_slug']) != record['resolved_slug']:
+        raise DataError('noncanonical redirect target')
     if record.get('status') == 'gone' and record.get('http_status') == 404:
         if record.get('tracks') or record.get('tracks_complete'):
             raise DataError(f'{slug}: a 404 cannot contain a complete track list')
@@ -207,7 +209,7 @@ def validate_record(record):
             raise DataError(f'{slug}: invalid track title/basename')
         for field in ('disc', 'num'):
             value = track.get(field)
-            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < (0 if field == 'disc' else 1)):
                 raise DataError(f'{slug}: invalid {field}')
         identity = str(track.get('songid') or track['basename'])
         if identity in identities:
@@ -270,4 +272,107 @@ def require_complete(catalogue, metadata, recent_state=None):
     result = inspect(catalogue, metadata, recent_state)
     if not result[-1]['complete']:
         raise IncompleteData(f"live dataset not complete: {result[-1]['pending']} albums pending; refusing publication")
+    return result
+
+
+def inspect_cumulative(catalogue_path, metadata_path, recent_state=None):
+    """The complete accumulated snapshot, independent of the retry queue.
+
+    The certified listing is a one-time seed, not a daily replacement. Only
+    this generation's metadata and its own recent-discovery journal extend it.
+    A failed refresh retains the last valid record; it never empties an album.
+    """
+    seed = read_catalogue(catalogue_path)
+    records = latest_records(metadata_path)
+    journal = Path(recent_state).with_name('recent-albums.ndjson') if recent_state else None
+    rows = {row['slug']: dict(row) for row in seed['albums']}
+    required_after = {}
+    if journal and journal.exists():
+        for _, row in jsonl(journal):
+            slug = canonical_slug(row.get('slug'))
+            if not isinstance(row.get('title'), str) or not row['title'].strip():
+                raise DataError('recent discovery has no album title')
+            stamp(row.get('discovered_at'))
+            rows[slug] = dict(rows.get(slug, {}), **dict(row, slug=slug))
+    if recent_state and Path(recent_state).exists():
+        state = json.loads(Path(recent_state).read_text(encoding='utf-8'))
+        for item in state.get('pending', {}).values():
+            slug = canonical_slug(item.get('slug'))
+            required_after[slug] = max(required_after.get(slug, 0), stamp(item.get('discovered_at')))
+            pending_row = dict(item.get('row') or {}, slug=slug)
+            pending_row.setdefault('title', slug)
+            rows.setdefault(slug, pending_row)
+    terminal_observations = {}
+    for slug, record in records.items():
+        if record['status'] == 'ok':
+            target = record.get('resolved_slug') or slug
+            terminal_observations[target] = max(terminal_observations.get(target, (0, 0)), record['_order'])
+    aliases = {slug: record['resolved_slug'] for slug, record in records.items()
+               if record.get('resolved_slug') and record['resolved_slug'] != slug
+               and record['_order'] > terminal_observations.get(slug, (0, 0))}
+
+    def resolve(slug):
+        visited = set()
+        while slug in aliases:
+            if slug in visited:
+                raise DataError('cyclic album redirect metadata')
+            visited.add(slug)
+            slug = aliases[slug]
+        return slug
+
+    aliases = {slug: resolve(slug) for slug in aliases}
+    canonical_records = {}
+    for slug, record in records.items():
+        target = aliases.get(slug, slug)
+        previous = canonical_records.get(target)
+        if previous is None or record['_order'] > previous['_order']:
+            canonical_records[target] = record if slug == target else dict(record, slug=target)
+        rows.setdefault(slug, {'slug': slug, 'title': record.get('title') or slug})
+    # A canonical page obtained through a redirect is already fetched; do not
+    # request it again merely because its original request used an alias.
+    for slug, record in canonical_records.items():
+        rows.setdefault(slug, {'slug': slug, 'title': record.get('title') or slug})
+    pending, missing, stale = [], set(), set()
+    registry = {}
+    for requested, row in rows.items():
+        slug = aliases.get(requested, requested)
+        # Keep only semantic listing fields in the durable registry identity.
+        normalized = {key: row.get(key) for key in ('title', 'year', 'album_type', 'platforms')}
+        normalized.update(slug=slug, title=normalized['title'] or slug)
+        if slug not in registry or requested == slug:
+            registry[slug] = normalized
+        record = canonical_records.get(slug)
+        observed = records.get(requested, record)
+        needs_refresh = bool(observed and observed['_order'][0] <= required_after.get(requested, 0))
+        if record is None:
+            pending.append(requested)
+            missing.add(slug)
+        elif needs_refresh:
+            pending.append(requested)
+            stale.add(slug)
+    selected = {slug: record for slug, record in canonical_records.items() if record['status'] == 'ok'}
+    unavailable = sorted(slug for slug, record in canonical_records.items() if record['status'] == 'gone')
+    albums = sorted(registry.values(), key=lambda row: row['slug'])
+    catalogue = dict(seed, albums=albums, catalogue_id=catalogue_id(albums),
+                     seed_catalogue_id=seed['catalogue_id'], aliases=aliases,
+                     completeness_scope='cumulative_snapshot')
+    summary = {
+        'data_source': SOURCE, 'catalogue_id': catalogue['catalogue_id'],
+        'total': len(albums), 'fetched': len(selected), 'unavailable': len(unavailable),
+        'pending': len(pending), 'missing_albums': len(missing),
+        'refresh_pending': len(stale), 'retained_last_good': len(stale & set(selected)),
+        'tracks': sum(record['track_count'] for record in selected.values()),
+        'complete': not pending and bool(selected), 'snapshot_complete': bool(selected),
+        'completeness_scope': 'cumulative_snapshot', 'alias_count': len(aliases),
+        'album_inventory_sha256': hashlib.sha256(stable_bytes(sorted(selected))).hexdigest(),
+        'fetched_percent': min(99.9999, round(100 * len(selected) / len(albums), 4))
+                           if len(selected) < len(albums) else 100.0, 'legacy_inputs': [],
+    }
+    return catalogue, selected, unavailable, sorted(set(pending)), summary
+
+
+def require_cumulative(catalogue, metadata, recent_state=None):
+    result = inspect_cumulative(catalogue, metadata, recent_state)
+    if not result[-1]['snapshot_complete']:
+        raise IncompleteData('no complete album records; refusing an empty cumulative snapshot')
     return result

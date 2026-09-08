@@ -64,6 +64,7 @@ def validate_state(directory):
         if record is not None and (not isinstance(record, dict) or record.get('data_source') != live_data.SOURCE):
             raise live_data.DataError(f'{name}: checkpoint belongs to a different pipeline')
 
+    read_retry_state(read_json(directory / 'discovery.json', {}))
 
 def pack_checkpoint(directory, output):
     directory, output = Path(directory), Path(output)
@@ -213,18 +214,29 @@ def script(name, arguments):
 
 def progress(directory):
     directory = Path(directory)
-    if not (directory / 'catalogue.json').exists():
+    seed_complete = (directory / 'catalogue.json').exists()
+    if not seed_complete:
         summary = {'data_source': live_data.SOURCE, 'phase': 'listing', 'complete': False,
-                   'published': False, 'total': None, 'fetched': 0, 'pending': None, 'tracks': 0}
+                   'snapshot_complete': False, 'published': False, 'total': None,
+                   'fetched': 0, 'pending': None, 'tracks': 0}
         pending = []
     else:
-        _, _, _, pending, summary = live_data.inspect(
+        catalogue, selected, unavailable, pending, summary = live_data.inspect_cumulative(
             directory / 'catalogue.json', directory / 'album-meta.ndjson', directory / 'recent-state.json')
+        last = read_json(directory / 'last-published.json', {})
+        inventory = last.get('published_albums', [])
+        if not isinstance(inventory, list):
+            raise live_data.DataError('invalid published album inventory')
+        available = set(selected) | set(unavailable)
+        for slug in inventory:
+            slug = live_data.canonical_slug(slug)
+            if catalogue['aliases'].get(slug, slug) not in available:
+                raise live_data.DataError('previously published album data is missing; refusing a reduced snapshot')
         summary = dict(summary, phase='metadata', published=False)
     discovery = read_json(directory / 'discovery.json', {})
-    summary['discovery_complete'] = (discovery.get('listing_complete') is True
-                                     and discovery.get('recent_complete') is True)
-    summary['ready_for_publish'] = bool(summary['complete'] and summary['discovery_complete'])
+    summary['discovery_complete'] = bool(seed_complete and discovery.get('recent_complete') is True)
+    summary['crawl_complete'] = summary['complete']
+    summary['ready_for_publish'] = bool(seed_complete and summary['snapshot_complete'])
     live_data.atomic_json(directory / 'progress.json', summary)
     print(json.dumps(summary, ensure_ascii=False), flush=True)
     return pending, summary
@@ -247,7 +259,7 @@ def recent_arguments(directory):
 
 def build_outputs(directory, output):
     output.mkdir(parents=True, exist_ok=True)
-    common = ['--catalogue', str(directory / 'catalogue.json'),
+    common = ['--cumulative', '--catalogue', str(directory / 'catalogue.json'),
               '--recent-state', str(directory / 'recent-state.json')]
     build_library.main(common + ['--meta', str(directory / 'album-meta.ndjson'),
                                 '--out', str(output / 'library.json'), '--gzip'])
@@ -259,6 +271,26 @@ def build_outputs(directory, output):
     return manifest
 
 
+def verify_initial_size(directory, repo, manifest):
+    # One-time cutover guard: read the previous manifest's row COUNT, never
+    # its index rows. Subsequent runs use only our own saved album inventory.
+    if read_json(directory / 'last-published.json', {}).get('tag'):
+        return
+    remote = release_info(repo, 'song-index')
+    if remote is None:
+        return
+    if 'songs-index.json' not in {item['name'] for item in remote.get('assets', [])}:
+        raise live_data.DataError('existing song index has no manifest; cannot verify initial snapshot size')
+    with tempfile.TemporaryDirectory() as temporary:
+        gh(repo, 'download', 'song-index', '--pattern', 'songs-index.json', '--dir', temporary)
+        previous = read_json(Path(temporary) / 'songs-index.json')
+    count = previous.get('songs') if isinstance(previous, dict) else None
+    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+        raise live_data.DataError('existing manifest has no trustworthy row count')
+    if manifest['songs'] < count:
+        raise live_data.IncompleteData('initial cumulative snapshot is smaller than the existing full index')
+
+
 def publication_signature(manifest):
     return {key: manifest[key] for key in ('data_source', 'catalogue_id',
                                           'library_content_sha256', 'content_sha256', 'sha256')}
@@ -267,7 +299,7 @@ def publication_signature(manifest):
 def publish(directory, output, repo, manifest):
     _, current = progress(directory)
     if not current['ready_for_publish'] or manifest.get('complete') is not True:
-        raise live_data.IncompleteData('publication requires a complete live dataset')
+        raise live_data.IncompleteData('publication requires a valid full cumulative snapshot')
     if manifest.get('data_source') != live_data.SOURCE:
         raise live_data.DataError('refusing to publish a foreign/legacy dataset')
     if (manifest.get('catalogue_id') != current.get('catalogue_id')
@@ -291,17 +323,30 @@ def publish(directory, output, repo, manifest):
             or library.get('catalogue_id') != current['catalogue_id']
             or gzip_content_hash != live_data.digest_file(output / 'library.json')):
         raise live_data.DataError('serving artifact provenance or compressed contents do not match')
+    inventory = sorted(album['slug'] for album in library['albums'])
+    if (len(inventory) != len(set(inventory))
+            or hashlib.sha256(live_data.stable_bytes(inventory)).hexdigest() != current['album_inventory_sha256']):
+        raise live_data.DataError('library does not contain the complete accumulated album inventory')
     signature = publication_signature(manifest)
     last = read_json(directory / 'last-published.json', {})
     if last.get('signature') == signature and last.get('tag'):
         remote = release_info(repo, last['tag'])
         if remote and not remote.get('isDraft'):
-            print('Complete dataset is unchanged; no release update.', flush=True)
+            # A fresh observation can leave the actual serving contents unchanged.
+            # Remember its inputs so later runs do not rebuild the full index again.
+            last.update(published_albums=inventory, input_signature={
+                'metadata_sha256': manifest['metadata_sha256'],
+                'catalogue_id': manifest['catalogue_id'],
+            })
+            live_data.atomic_json(directory / 'last-published.json', last)
+            print('Complete cumulative snapshot is unchanged; no release update.', flush=True)
             return False
+    verify_initial_size(directory, repo, manifest)
     tag = time.strftime('library-live-v2-%Y%m%d-%H%M%S-', time.gmtime()) + os.environ.get('GITHUB_RUN_ID', 'manual')
     notes = (f"{MARKER}\n\n{manifest['albums']} complete albums / {manifest['songs']} tracks. "
              f"{len(manifest['unavailable_albums'])} explicitly unavailable HTTP-404 albums. "
-             'No legacy index, title cache or archival snapshot was used as input.')
+             f"Full cumulative snapshot; {manifest.get('pending_albums', 0)} requests remain queued. "
+             'No legacy index rows, title cache or archival snapshot were used as input.')
     gh(repo, 'create', tag, '--draft', '--title', tag, '--notes', notes)
     gh(repo, 'upload', tag, output / 'library.json', output / 'library.json.gz',
        output / 'songs.tsv.gz', output / 'songs-index.json')
@@ -315,22 +360,99 @@ def publish(directory, output, repo, manifest):
     gh(repo, 'edit', tag, '--draft=false', '--latest')
     live_data.atomic_json(directory / 'last-published.json', {
         'data_source': live_data.SOURCE, 'tag': tag, 'signature': signature,
-        'published_at': live_data.now(),
+        'published_at': live_data.now(), 'published_albums': inventory,
+        'input_signature': {'metadata_sha256': manifest['metadata_sha256'],
+                            'catalogue_id': manifest['catalogue_id']},
     })
-    print('Published complete live-only dataset: ' + tag, flush=True)
+    print('Published full cumulative live-only snapshot: ' + tag, flush=True)
     return True
 
 
-def run(directory, repo, mode='backfill', minutes=180, do_publish=False, checkpoint=False):
+def read_retry_state(discovery):
+    retry = discovery.get('retry', {})
+    if not isinstance(retry, dict):
+        raise live_data.DataError('invalid retry checkpoint')
+    for slug, item in retry.items():
+        live_data.canonical_slug(slug)
+        if (not isinstance(item, dict) or not isinstance(item.get('attempts'), int)
+                or isinstance(item['attempts'], bool) or item['attempts'] < 1):
+            raise live_data.DataError('invalid retry attempt count')
+        live_data.stamp(item.get('last_attempt'))
+        live_data.stamp(item.get('next_retry_at'))
+    return retry
+
+
+def due_targets(directory, pending, retry, attempted, now=None):
+    now = time.time() if now is None else now
+    recent = read_json(directory / 'recent-state.json', {}).get('pending', {})
+    changes = {}
+    for item in recent.values():
+        slug = live_data.canonical_slug(item['slug'])
+        changes[slug] = max(changes.get(slug, 0), live_data.stamp(item['discovered_at']))
+    due = []
+    for slug in pending:
+        if slug in attempted:
+            continue
+        last = retry.get(slug)
+        if (last is None or live_data.stamp(last['next_retry_at']) <= now
+                or changes.get(slug, 0) > live_data.stamp(last['last_attempt'])):
+            due.append(slug)
+    return sorted(due, key=lambda slug: (slug not in changes, slug in retry,
+                                        hashlib.sha256(slug.encode()).digest()))
+
+
+def file_size(path):
+    return path.stat().st_size if path.exists() else 0
+
+
+def collect_attempts(directory, offsets, retry):
+    """Read only appended observations; unstarted requests are not failures."""
+    attempted = {}
+    for name, offset in offsets.items():
+        path = directory / name
+        if not path.exists():
+            continue
+        if path.stat().st_size < offset:
+            raise live_data.DataError('crawl journal was truncated during a slice')
+        with path.open('rb') as stream:
+            stream.seek(offset)
+            for raw in stream:
+                if name == 'album-meta.ndjson':
+                    record = json.loads(raw)
+                    slug = live_data.validate_record(record)
+                    attempted[slug] = (True, record['crawled_at'], '')
+                else:
+                    fields = raw.decode('utf-8').rstrip('\n').split('\t')
+                    if len(fields) < 4:
+                        raise live_data.DataError('failure journal has no observation timestamp')
+                    slug = live_data.canonical_slug(fields[0])
+                    attempted[slug] = (fields[1] == 'gone', fields[3], fields[1])
+    for slug, (ok, observed, error) in attempted.items():
+        observed_time = live_data.stamp(observed)
+        if ok:
+            retry.pop(slug, None)
+        else:
+            count = retry.get(slug, {}).get('attempts', 0) + 1
+            delay = min(24, 2 ** min(count - 1, 5)) * 3600
+            retry[slug] = {'attempts': count, 'last_attempt': observed,
+                           'next_retry_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(observed_time + delay)),
+                           'last_error': error[:200]}
+    return set(attempted)
+
+
+def run(directory, repo, mode='incremental', minutes=20, do_publish=False, checkpoint=False):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     validate_state(directory)
     deadline = time.monotonic() + minutes * 60
     discovery = read_json(directory / 'discovery.json', {'data_source': live_data.SOURCE})
+    retry = read_retry_state(discovery)
     if mode != 'build':
-        needs_listing = (mode == 'refresh' or not (directory / 'catalogue.json').exists()
-                         or discovery.get('listing_complete') is not True)
-        if needs_listing:
+        # History is enumerated only at cold bootstrap. "refresh" remains a
+        # backwards-compatible name for incremental updates, never a full sweep.
+        if not (directory / 'catalogue.json').exists():
+            if read_json(directory / 'last-published.json', {}).get('tag'):
+                raise live_data.DataError('published cumulative state lost its seed catalogue')
             discovery.update(listing_complete=False, recent_complete=False)
             live_data.atomic_json(directory / 'discovery.json', discovery)
             result = script('crawl_index_pages.py', [
@@ -345,49 +467,74 @@ def run(directory, repo, mode='backfill', minutes=180, do_publish=False, checkpo
             if result:
                 progress(directory)
                 return False
+        # A validated last-good seed remains usable even if the former daily
+        # full sweep left an incomplete staging directory.
+        discovery['listing_complete'] = True
         seed_recent(directory)
-        result = script('crawl_recent.py', recent_arguments(directory) + [
-            '--overlap-days', 3, '--max-pages', 10, '--deadline-minutes', 5])
-        discovery['recent_complete'] = result == 0
+        remaining = (deadline - time.monotonic()) / 60
+        if remaining > 0:
+            result = script('crawl_recent.py', recent_arguments(directory) + [
+                '--overlap-days', 3, '--max-pages', 10, '--deadline-minutes', min(5, remaining)])
+            discovery['recent_complete'] = result == 0
         live_data.atomic_json(directory / 'discovery.json', discovery)
         if checkpoint:
             save(directory, repo)
+        attempted = set()
         while time.monotonic() < deadline:
             pending, before = progress(directory)
-            if not pending:
+            due = due_targets(directory, pending, retry, attempted)
+            print(f'Incremental queue: {len(due)} due; {len(pending) - len(due)} deferred; '
+                  f'{before["fetched"]} complete albums retained.', flush=True)
+            if not due:
                 break
-            # Only unresolved/newly changed albums are requested, not all rows.
-            pending.sort(key=lambda slug: hashlib.sha256(slug.encode()).digest())
             queue = directory / 'pending-slugs.txt'
-            queue.write_text(''.join(slug + '\n' for slug in pending), encoding='utf-8')
+            queue.write_text(''.join(slug + '\n' for slug in due), encoding='utf-8')
             remaining = min(25, (deadline - time.monotonic()) / 60)
             if remaining <= 0:
                 break
+            offsets = {name: file_size(directory / name)
+                       for name in ('album-meta.ndjson', 'album-meta-failures.log')}
             result = script('crawl_album_meta.py', [
                 '--slugs-file', queue, '--out', directory / 'album-meta.ndjson',
                 '--failures', directory / 'album-meta-failures.log', '--refresh', '--retry-failures',
-                '--order', 'file',
-                '--workers', 3, '--delay', 0.9, '--jitter', 0.6, '--retries', 4,
+                '--order', 'file', '--workers', 3, '--delay', 0.9, '--jitter', 0.6, '--retries', 4,
                 '--deadline-minutes', remaining, '--progress-every', 200,
             ])
             if result:
-                raise live_data.DataError('metadata crawler failed; refusing to publish')
+                raise live_data.DataError('metadata crawler failed; preserving the published snapshot')
+            attempted.update(collect_attempts(directory, offsets, retry))
+            discovery['retry'] = retry
+            live_data.atomic_json(directory / 'discovery.json', discovery)
             if script('crawl_recent.py', recent_arguments(directory) + ['--ack-only']):
-                raise live_data.DataError('recent update acknowledgement failed; refusing to publish')
+                raise live_data.DataError('recent update acknowledgement failed; refusing publication')
             _, after = progress(directory)
             if checkpoint:
                 save(directory, repo)
             if after['pending'] >= before['pending']:
-                print('No forward progress this slice; leave failures for the next run.', flush=True)
+                print('No forward progress; retain valid records and defer failed requests.', flush=True)
                 break
     _, summary = progress(directory)
     if not summary['ready_for_publish']:
-        print('Incomplete collection retained as a checkpoint only; serving data is unchanged.', flush=True)
+        print('No usable cumulative snapshot yet; existing serving data is unchanged.', flush=True)
         return False
+    if summary['pending']:
+        print(f'::notice title=Cumulative snapshot::{summary["pending"]} requests remain pending; '
+              f'all {summary["fetched"]} valid accumulated albums are retained.', flush=True)
+    last = read_json(directory / 'last-published.json', {})
+    inputs = {'metadata_sha256': live_data.digest_file(directory / 'album-meta.ndjson'),
+              'catalogue_id': summary['catalogue_id']}
+    if do_publish and last.get('input_signature') == inputs and last.get('tag'):
+        remote = release_info(repo, last['tag'])
+        if remote and not remote.get('isDraft'):
+            summary.update(phase='unchanged', published=False, last_release=last['tag'])
+            live_data.atomic_json(directory / 'progress.json', summary)
+            print('Cumulative snapshot is unchanged; no full rebuild or release upload.', flush=True)
+            return False
     output = directory.parent / 'live-output'
     manifest = build_outputs(directory, output)
     published = publish(directory, output, repo, manifest) if do_publish else False
-    summary.update(phase='ready', published=published)
+    last = read_json(directory / 'last-published.json', {})
+    summary.update(phase='ready', published=published, last_release=last.get('tag'))
     live_data.atomic_json(directory / 'progress.json', summary)
     return published
 
@@ -397,8 +544,8 @@ def main(argv=None):
     parser.add_argument('command', choices=('restore', 'run', 'save', 'status'))
     parser.add_argument('--state-dir', default='work/live-v2')
     parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY', 'nmt3325/khinsider-index'))
-    parser.add_argument('--mode', choices=('refresh', 'backfill', 'build'), default='backfill')
-    parser.add_argument('--minutes', type=float, default=180)
+    parser.add_argument('--mode', choices=('incremental', 'refresh', 'backfill', 'build'), default='incremental')
+    parser.add_argument('--minutes', type=float, default=20)
     parser.add_argument('--publish', action='store_true')
     parser.add_argument('--checkpoint', action='store_true')
     args = parser.parse_args(argv)
@@ -418,7 +565,7 @@ def main(argv=None):
         print(json.dumps(summary, ensure_ascii=False), flush=True)
         if os.environ.get('GITHUB_STEP_SUMMARY'):
             with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as stream:
-                stream.write('## Standalone live-data status\n\n')
+                stream.write('## Incremental crawl / full cumulative release\n\n')
                 for key, value in summary.items():
                     stream.write(f'- {key}: **{value}**\n')
                 stream.write('\nA successful bounded crawl is not necessarily a published complete dataset.\n')

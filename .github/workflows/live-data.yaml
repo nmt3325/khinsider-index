@@ -1,4 +1,4 @@
-name: Standalone live-data engine
+name: Incremental crawler and cumulative snapshots
 
 on:
   workflow_call:
@@ -43,7 +43,7 @@ jobs:
       - name: Restore only this generation's verified checkpoint
         id: restore
         run: python scripts/live_pipeline.py restore --state-dir "$STATE_DIR" --repo "$GITHUB_REPOSITORY"
-      - name: Collect and publish only a complete live-only dataset
+      - name: Fetch only deltas and publish the full accumulated index
         env:
           MODE: ${{ inputs.mode }}
           MINUTES: ${{ inputs.minutes }}

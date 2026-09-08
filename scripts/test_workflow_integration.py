@@ -17,13 +17,16 @@ def test_build_only_cannot_publish_partial_metadata(monkeypatch, tmp_path):
     assert json.loads((state / 'progress.json').read_text())['pending'] == 1
 
 
-def test_partial_recent_discovery_blocks_publication(monkeypatch, tmp_path):
+def test_partial_recent_discovery_preserves_a_publishable_accumulated_snapshot(monkeypatch, tmp_path):
     state = ready(tmp_path / 'state')
     live_data.atomic_json(state / 'discovery.json', {'data_source': live_data.SOURCE,
                                                   'listing_complete': True, 'recent_complete': False})
-    monkeypatch.setattr(live_pipeline, 'publish', lambda *a: pytest.fail('discovery was incomplete'))
-    assert not live_pipeline.run(state, 'owner/repo', mode='build', do_publish=True)
-    assert not (tmp_path / 'live-output').exists()
+    published = []
+    monkeypatch.setattr(live_pipeline, 'publish', lambda *a: published.append(a[-1]) or True)
+    assert live_pipeline.run(state, 'owner/repo', mode='build', do_publish=True)
+    assert published[0]['songs'] == 1
+    summary = json.loads((state / 'progress.json').read_text())
+    assert summary['snapshot_complete'] and not summary['discovery_complete']
 
 
 @pytest.mark.parametrize('minutes', ['0', '-1', '241'])
